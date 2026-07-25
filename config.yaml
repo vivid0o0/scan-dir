@@ -1,0 +1,48 @@
+# Ignore exact relative paths (and everything under them)
+paths: []
+
+# Ignore by type: file, dir, link
+types: []
+
+# Ignore by extension (include the leading dot)
+extensions: []
+
+# Ignore by basename (files or folders)
+names:
+  - .git
+  - node_modules
+  - __pycache__
+  - .venv
+  - venv
+  - dist
+  - build
+  - .next
+  - .turbo
+  - .cache
+  - .idea
+  - .pytest_cache
+  - .mypy_cache
+  - .ruff_cache
+  - .tox
+  - .eggs
+  - .DS_Store
+  - Thumbs.db
+  - coverage
+
+# File visibility controls
+ignore-hidden: false # ignores files starting with a dot (e.g., .git, .env)
+ignore-empty: false # ignores empty files and folders
+
+# Rendering controls
+# styling: full | low | minimal (best for agents)
+scan-styling: full
+# show file-type emojis in entry names: true | false
+scan-emojis: true
+# comma-separated metadata items to show.
+scan-data: "tree, lines, size, modified, type, git, summary"
+
+# Runtime controls
+scan-timeout: 60 # seconds
+auto-copy: false # copy to clipboard after scan
+
+### NOTE: The above settings are defaults. You can override them via command-line arguments.
