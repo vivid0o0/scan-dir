@@ -64,7 +64,7 @@ Mutually exclusive — at most one per invocation:
 | Mode | Behavior |
 | ---- | -------- |
 | `--ignore` | Exclude entries matching the selectors. This is the default mode whenever any selector (`-f`, `-t`, `-e`, `-n`) is present. |
-| `--only` | Include only entries that match explicit selectors. The default ignore list (`names:` in `config.yaml`) still applies — `--only` does not turn default-ignored names into included names. Shorthand values are accepted (see Selectors). |
+| `--only` | Include only entries that match explicit CLI selectors. Config selectors are not applied — they neither add to nor override the include set. Shorthand values are accepted (see Selectors). |
 | `--full` | Include every entry, including hidden (dot-prefixed) and empty ones. Equivalent to `--ignore-hidden=false --ignore-empty=false` plus no selector filtering. |
 
 ## Selectors
@@ -73,7 +73,7 @@ Mutually exclusive — at most one per invocation:
 | ---- | ------- |
 | `-f, --paths <paths...>` | Relative paths and everything inside matched directories. |
 | `-t, --types <types...>` | Entry types: `file`, `dir`, `link`. |
-| `-e, --extensions <ext...>` | Extensions such as `.ts`, `.json`, `.md` (leading dot optional but conventional). |
+| `-e, --extensions <ext...>` | Extensions such as `.ts`, `.json`, `.md` (leading dot required). |
 | `-n, --names <names...>` | Exact file or directory basenames. |
 
 ### `--only` shorthand
@@ -120,7 +120,7 @@ For agent consumption, prefer `--scan-styling minimal` and `--scan-emojis false`
 | Flag | Values | Notes |
 | ---- | ------ | ----- |
 | `--scan-timeout` | `<seconds>` (float) | Stop scanning after the given time and print the partial result with a timeout notice. Default `60`. |
-| `--auto-copy` | `true` \| `false` | Copy the plain (ANSI-stripped) scan output to the clipboard after rendering. The shipped config defaults to `false`. |
+| `--auto-copy` | `true` \| `false` | Copy the plain (ANSI-stripped) scan output to the clipboard after rendering. Shipped config defaults to `false`; built-in (no config file) defaults to `true`. |
 
 If the clipboard backend is unavailable (headless server, container, CI), `--auto-copy true` warns on stderr and continues; the scan output on stdout is unaffected. Pass `--auto-copy false` in non-interactive contexts to silence the warning.
 
@@ -130,7 +130,11 @@ If the clipboard backend is unavailable (headless server, container, CI), `--aut
 | ---- | ----- |
 | `--config <path>` | Use a specific `config.yaml` instead of the one next to the scan root. |
 
+Config discovery order (first found wins): `--config <path>` → `$PWD/config.yaml` → `$XDG_CONFIG_HOME/project-summarizer/config.yaml` (user config, persists across installs) → `$APP_DIR/config.yaml` (installed default) → built-in defaults. The installer stages `config.yaml` alongside the runtime and repairs it on re-run if missing. User config in XDG_CONFIG_HOME is never touched by the installer.
+
 When no CLI flags are passed, `prs` reads `config.yaml` next to the scan root. The file accepts the same keys as the CLI options; both kebab-case (`scan-styling`, `ignore-hidden`) and snake_case (`scan_styling`, `ignore_hidden`) are accepted. CLI flags override config values. The shipped `config.yaml` uses kebab-case and ships a default `names:` ignore list (`.git`, `node_modules`, `__pycache__`, `.venv`, `dist`, `build`, ...).
+
+Selectors use per-category replacement: CLI `-n foo` replaces the config `names:` list rather than appending. Omit `tree` from `--scan-data` for a flat entry list without tree indentation; omit `summary` to hide the summary block.
 
 ## Git markers
 

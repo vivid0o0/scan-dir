@@ -64,6 +64,8 @@ example-app/                                       entries     lines       size 
 curl -fsSL https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/install.sh | bash
 ```
 
+The installer automatically stages `config.yaml` (the default ignore list and rendering/runtime defaults) alongside the runtime. Re-running the installer detects missing or outdated config files and repairs them.
+
 ### Full installation (including SKILL.md)
 
 Give this prompt to your favorite AI agent:
@@ -119,13 +121,15 @@ prs [path] [options]
 | Option                      | Description                                                                   |
 | --------------------------- | ----------------------------------------------------------------------------- |
 | `--scan-timeout <seconds>`  | Stop scanning after the given number of seconds and print the partial result. |
-| `--auto-copy <true\|false>` | Copy the scan output to the clipboard after scanning.                         |
+| `--auto-copy <true\|false>` | Copy the scan output to the clipboard after scanning. Default: `false` in shipped config, `true` when no config file is found. |
 
 ### Configuration
 
-| Option            | Description                        |
-| ----------------- | ---------------------------------- |
-| `--config <path>` | Use a specific `config.yaml` file. |
+| Option              | Description                           |
+| ------------------- | ------------------------------------- |
+| `--config <path>`   | Use a specific `config.yaml` file.    |
+| `--help`, `-h`      | Show help text and exit.              |
+| `--version`         | Show version number and exit.         |
 
 ### Notes
 
@@ -133,6 +137,8 @@ prs [path] [options]
 * When no command-line options are provided, `prs` uses `config.yaml`.
 * Command-line options override matching `config.yaml` values.
 * `--only` uses explicit CLI selectors and does not turn default ignored names into included names.
+* Config discovery precedence (highest first): `--config <path>` → `$PWD/config.yaml` → `$XDG_CONFIG_HOME/project-summarizer/config.yaml` (user config) → `$APP_DIR/config.yaml` (installed default) → built-in defaults. User config persists across installs and is never overwritten.
+* Selectors use per-category replacement: CLI `-n foo` replaces the config `names:` list rather than appending.
 
 ## Configuration file
 
@@ -207,6 +213,8 @@ auto-copy: false # copy to clipboard after scan
 | ------------------- | ------------------------------------------------------------ |
 | `"item, item, ..."` | tree, lines, size, modified, type, git, summary. |
 
+When `tree` is omitted from scan-data, entries are shown as a flat list (no tree indentation). When `summary` is omitted, the summary block is hidden.
+
 ## Git status markers
 
 Git markers appear when the scan path is inside a git repository.
@@ -223,6 +231,15 @@ Git markers appear when the scan path is inside a git repository.
 
 * When `--scan-timeout` is reached, `prs` stops scanning and prints the partial result with a timeout notice.
 * Empty entries are files with `0` bytes or directories with no scanned children.
+
+## Exit codes
+
+| Code | Meaning                         |
+| ---- | ------------------------------- |
+| `0`  | Success                         |
+| `1`  | Runtime error (PrsError, OSError, clipboard failure) |
+| `2`  | Configuration error (ConfigError) |
+| `130`| Interrupted (`Ctrl+C`)          |
 
 ## License
 

@@ -27,7 +27,7 @@ from typing import Iterator, Sequence
 PROGRAM_NAME = "prs"
 ALIAS_COMMAND = "project-summarizer"
 PRODUCT_TITLE = "Project Summarizer"
-VERSION = "2026.06.20.30"
+VERSION = "2026.06.20.31"
 CONFIG_FILE_NAME = "config.yaml"
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60.0
 ENTRY_TYPES = ("file", "dir", "link")
@@ -688,7 +688,7 @@ def load_yaml_payload(path: Path) -> dict[str, object]:
     except ConfigError:
         raise
     except Exception as exc:
-        raise ConfigError(f"unable to parse config file: {path}: {exc}") from exc
+        raise ConfigError(f"unable to parse config file: {sanitize_terminal_text(path)}: {exc}") from exc
 
     if not isinstance(loaded, dict):
         raise ConfigError(f"config file must contain a YAML mapping: {path}")
@@ -712,8 +712,18 @@ def find_config_path(explicit_path: str | None, root_path: Path) -> Path | None:
         candidate = root_path.parent / CONFIG_FILE_NAME
     if candidate.is_file():
         return candidate
+    # User-level config: XDG_CONFIG_HOME or ~/.config. Persists across
+    # installs and is user-owned (never overwritten by the installer).
+    try:
+        xdg_base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    except RuntimeError:
+        xdg_base = ""
+    if xdg_base:
+        xdg_config = Path(xdg_base) / "project-summarizer" / CONFIG_FILE_NAME
+        if xdg_config.is_file():
+            return xdg_config
     # Global installed config: next to the prs.py runtime. Supports layered
-    # defaults (project-local > global installed > built-in defaults).
+    # defaults (project-local > user > installed > built-in defaults).
     app_dir_config = Path(__file__).resolve().parent / CONFIG_FILE_NAME
     if app_dir_config.is_file():
         return app_dir_config
@@ -755,8 +765,8 @@ def is_status_token(value: str) -> bool:
 
 def render_status(color: bool | None = None) -> str:
     color = terminal_color_enabled() if color is None else color
-    cwd_config = Path.cwd() / CONFIG_FILE_NAME
-    config_text = sanitize_terminal_text(cwd_config) if cwd_config.is_file() else "not found in current directory"
+    cwd_config = find_config_path(None, Path.cwd())
+    config_text = sanitize_terminal_text(cwd_config) if cwd_config is not None else "not found (checked: project dir, user config, app dir)"
     # APP_DIR is the directory containing the prs executable that the user
     # actually invoked, falling back to the source file location when the
     # interpreter was started without an argv[0] (e.g., embedded runs).
@@ -1183,6 +1193,7 @@ def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
     config_payload = config_from_payload(file_payload)
     config_rules = normalize_rules(config_payload)
     explicit_rules = cli_rules(args)
+
     rules = FilterRules(
         paths=explicit_rules.paths if args.paths is not None else config_rules.paths,
         types=explicit_rules.types if args.types is not None else config_rules.types,
@@ -2312,9 +2323,37 @@ def name_column_width(scan_data: frozenset[str]) -> int:
     return max(NAME_COLUMN_MIN_WIDTH, terminal_columns() - metadata_width - separator_width)
 
 
+def render_flat_entries(root: EntryNode, result: ScanResult, config: RuntimeConfig, color: bool = False) -> list[str]:
+    lines: list[str] = []
+    headers = active_header_columns(config.scan_data)
+    width = name_column_width(config.scan_data)
+    root_label = display_name(root, config.scan_emojis)
+    root_marker = result.git_markers.get(".", "") if "git" in config.scan_data else ""
+    if headers and root.kind == "dir":
+        lines.append(render_padded_row(root_label, headers, root, width, color, header=True, marker=root_marker))
+    elif headers:
+        root_columns = metadata_columns(root, config.scan_data)[:len(headers)]
+        lines.append(render_padded_row(root_label, root_columns, root, width, color, marker=root_marker))
+    else:
+        label = f"{root_label} {root_marker}" if root_marker else root_label
+        lines.append(style(truncate_cells(label, width), *row_style_for_node(root, color), enabled=color))
+    stack: list[EntryNode] = []
+    if root.kind == "dir":
+        stack.extend(reversed(root.children))
+    while stack:
+        node = stack.pop()
+        plain_name = display_name(node, config.scan_emojis)
+        marker = result.git_markers.get(node.rel_path, "") if "git" in config.scan_data else ""
+        columns = metadata_columns(node, config.scan_data)[:len(headers)]
+        lines.append(render_padded_row(plain_name, columns, node, width, color, marker=marker))
+        if node.kind == "dir" and node.children:
+            stack.extend(reversed(node.children))
+    return lines
+
+
 def render_tree_lines(root: EntryNode, result: ScanResult, config: RuntimeConfig, color: bool = False) -> list[str]:
     if "tree" not in config.scan_data:
-        return []
+        return render_flat_entries(root, result, config, color)
     width = name_column_width(config.scan_data)
     lines: list[str] = []
     headers = active_header_columns(config.scan_data)

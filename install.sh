@@ -25,8 +25,9 @@ readonly PRIMARY_COMMAND='prs'
 readonly ALIAS_COMMAND='project-summarizer'
 readonly RUNTIME_SOURCE_NAME='prs.py'
 readonly SKILL_FILE_NAME='SKILL.md'
+readonly CONFIG_FILE_NAME='config.yaml'
 readonly DEFAULT_SOURCE_URL='https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/prs.py'
-readonly INSTALLER_VERSION='2026.06.20.30'
+readonly INSTALLER_VERSION='2026.06.20.31'
 readonly MINIMUM_PYTHON_VERSION='3.10'
 readonly MANAGED_MARKER='project-summarizer managed command'
 readonly BRIDGE_MARKER='project-summarizer managed active PATH bridge'
@@ -152,6 +153,7 @@ LOCK_TOKEN=''
 PYTHON_BIN=''
 RESOLVED_SOURCE=''
 RESOLVED_SKILL=''
+RESOLVED_CONFIG=''
 STAGED_APP_DIR=''
 STAGED_BIN_DIR=''
 CURRENT_STEP='startup'
@@ -1434,6 +1436,29 @@ resolve_skill_file() {
   log_raw "skill=(not available)"
 }
 
+resolve_config_file() {
+  local source_dir=''
+  source_dir="$(canonical_file_path "$(dirname -- "$RESOLVED_SOURCE")" 2>/dev/null || absolute_path "$(dirname -- "$RESOLVED_SOURCE")")"
+  local candidate="$source_dir/$CONFIG_FILE_NAME"
+  if [[ -f "$candidate" && -r "$candidate" ]]; then
+    RESOLVED_CONFIG="$(canonical_file_path "$candidate" 2>/dev/null || printf '%s' "$candidate")"
+    log_raw "config=$RESOLVED_CONFIG"
+    return 0
+  fi
+  if [[ -n "$SOURCE_URL" ]]; then
+    validate_source_url "$SOURCE_URL"
+    local config_url="${SOURCE_URL%/*}/$CONFIG_FILE_NAME"
+    local downloaded="$TMP_DIR/config-download.yaml"
+    if download_file "$config_url" "$downloaded" 2>/dev/null; then
+      RESOLVED_CONFIG="$downloaded"
+      log_raw "config=$RESOLVED_CONFIG (downloaded from $config_url)"
+      return 0
+    fi
+  fi
+  RESOLVED_CONFIG=''
+  log_raw "config=(not available)"
+}
+
 resolve_source() {
   local downloaded=''
   if [[ -n "$SOURCE_URL" ]]; then
@@ -1456,6 +1481,7 @@ resolve_source() {
   [[ -n "$RESOLVED_SOURCE" && -r "$RESOLVED_SOURCE" ]] || fail "source program not found; pass --source <path>"
   verify_sha256_if_requested "$RESOLVED_SOURCE"
   resolve_skill_file
+  resolve_config_file
   log_raw "source=$RESOLVED_SOURCE"
 }
 
@@ -1485,6 +1511,9 @@ copy_source_to_stage() {
   install -m "$PERMISSIONS_EXECUTABLE" "$RESOLVED_SOURCE" "$STAGED_APP_DIR/$RUNTIME_SOURCE_NAME"
   if [[ -n "$RESOLVED_SKILL" && -r "$RESOLVED_SKILL" ]]; then
     install -m "$PERMISSIONS_DATA_FILE" "$RESOLVED_SKILL" "$STAGED_APP_DIR/$SKILL_FILE_NAME"
+  fi
+  if [[ -n "$RESOLVED_CONFIG" && -r "$RESOLVED_CONFIG" ]]; then
+    install -m "$PERMISSIONS_DATA_FILE" "$RESOLVED_CONFIG" "$STAGED_APP_DIR/$CONFIG_FILE_NAME"
   fi
   printf '%s\n' "$MANAGED_MARKER" > "$STAGED_APP_DIR/.managed"
   printf '%s\n' "$INSTALLER_VERSION" > "$STAGED_APP_DIR/.installer-version"
@@ -1781,6 +1810,7 @@ validate_installed_commands() {
   fi
   [[ -x "$BIN_DIR/$PRIMARY_COMMAND" ]] || fail "installed command missing: $BIN_DIR/$PRIMARY_COMMAND"
   [[ -x "$BIN_DIR/$ALIAS_COMMAND" ]] || fail "installed alias missing: $BIN_DIR/$ALIAS_COMMAND"
+  [[ -f "$APP_DIR/$CONFIG_FILE_NAME" ]] || fail "installed default config missing: $APP_DIR/$CONFIG_FILE_NAME"
   "$BIN_DIR/$PRIMARY_COMMAND" version >/dev/null
   "$BIN_DIR/$PRIMARY_COMMAND" help >/dev/null
   "$BIN_DIR/$PRIMARY_COMMAND" status >/dev/null
@@ -1801,10 +1831,16 @@ write_manifest() {
   [[ "$DRY_RUN" == 1 ]] && return 0
   local manifest="$APP_DIR/$MANIFEST_NAME"
   local skill_entry=''
+  local config_entry=''
   if [[ -n "$RESOLVED_SKILL" && -r "$RESOLVED_SKILL" ]]; then
     skill_entry="skill=$(printf '%q' "$RESOLVED_SKILL")"
   else
     skill_entry="skill=''"
+  fi
+  if [[ -n "$RESOLVED_CONFIG" && -r "$RESOLVED_CONFIG" ]]; then
+    config_entry="config=$(printf '%q' "$RESOLVED_CONFIG")"
+  else
+    config_entry="config=''"
   fi
   cat > "$manifest" <<EOF
 product=$(printf '%q' "$PRODUCT_TITLE")
@@ -1817,6 +1853,7 @@ arch=$(printf '%q' "$ARCH")
 python=$(printf '%q' "$PYTHON_BIN")
 source=$(printf '%q' "$RESOLVED_SOURCE")
 $skill_entry
+$config_entry
 app_dir=$(printf '%q' "$APP_DIR")
 bin_dir=$(printf '%q' "$BIN_DIR")
 state_dir=$(printf '%q' "$STATE_DIR")
@@ -1873,14 +1910,15 @@ detect_existing_install() {
 
 should_skip_install() {
   # If the existing install is the same version as this installer and the
-  # runtime + commands are intact, skip the install (no-op). Otherwise proceed
-  # (upgrade or repair). Always returns 1 (don't skip) under --force or --dry-run.
+  # runtime + commands + config are intact, skip the install (no-op). Otherwise
+  # proceed (upgrade or repair). Always returns 1 under --force or --dry-run.
   [[ "$FORCE" == 0 && "$DRY_RUN" == 0 ]] || return 1
   [[ -n "$EXISTING_INSTALL_VERSION" ]] || return 1
   [[ "$EXISTING_INSTALL_VERSION" == "$INSTALLER_VERSION" ]] || return 1
   [[ -f "$APP_DIR/$RUNTIME_SOURCE_NAME" ]] || return 1
   [[ -x "$BIN_DIR/$PRIMARY_COMMAND" ]] || return 1
   [[ -x "$BIN_DIR/$ALIAS_COMMAND" ]] || return 1
+  [[ -f "$APP_DIR/$CONFIG_FILE_NAME" ]] || return 1
   return 0
 }
 
