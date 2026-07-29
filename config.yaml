@@ -1,13 +1,18 @@
-# Ignore exact relative paths (and everything under them)
+# config.yaml -- Project Summarizer managed defaults
+# Safe default filtering, visibility, rendering, and runtime behavior.
+# Tags: configuration, filtering, rendering, runtime
+# 2026-07-28
+
+# Ignore exact relative paths and everything below matched directories.
 paths: []
 
-# Ignore by type: file, dir, link
+# Ignore entry types: file, dir, link.
 types: []
 
-# Ignore by extension (include the leading dot)
+# Ignore file extensions. Include the leading dot.
 extensions: []
 
-# Ignore by basename (files or folders)
+# Ignore exact file or directory basenames.
 names:
   - .git
   - node_modules
@@ -29,20 +34,15 @@ names:
   - Thumbs.db
   - coverage
 
-# File visibility controls
-ignore-hidden: false # ignores files starting with a dot (e.g., .git, .env)
-ignore-empty: false # ignores empty files and folders
+# Visibility.
+ignore-hidden: false
+ignore-empty: false
 
-# Rendering controls
-# styling: full | low | minimal (best for agents)
+# Rendering.
 scan-styling: full
-# show file-type emojis in entry names: true | false
 scan-emojis: true
-# comma-separated metadata items to show.
 scan-data: "tree, lines, size, modified, type, git, summary"
 
-# Runtime controls
-scan-timeout: 60 # seconds
-auto-copy: false # copy to clipboard after scan
-
-### NOTE: The above settings are defaults. You can override them via command-line arguments.
+# Runtime.
+scan-timeout: 60
+auto-copy: false

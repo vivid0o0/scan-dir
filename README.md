@@ -61,10 +61,10 @@ example-app/                                       entries     lines       size 
 ### Linux / macOS
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/install.sh | bash
 ```
 
-The installer automatically stages `config.yaml` (the default ignore list and rendering/runtime defaults) alongside the runtime. Re-running the installer detects missing or outdated config files and repairs them.
+Requires Python 3.10+; the installer and managed wrappers require Bash 3.2+. The installer stages `prs.py`, `config.yaml`, and `SKILL.md`, verifies their embedded SHA-256 digests, and installs both command names. Re-running it validates and repairs managed files; owned managed directories are automatically stripped of unsafe group/other write permissions. Run `bash install.sh --help` for installer options.
 
 ### Full installation (including SKILL.md)
 
@@ -105,8 +105,10 @@ prs [path] [options]
 
 | Option            | Description                                       |
 | ----------------- | ------------------------------------------------- |
-| `--ignore-hidden` | Ignore files and directories starting with a dot. |
-| `--ignore-empty`  | Ignore empty files and directories.               |
+| `--ignore-hidden`  | Ignore files and directories starting with a dot. |
+| `--include-hidden` | Show hidden entries, overriding configuration.       |
+| `--ignore-empty`   | Ignore empty files and directories.                |
+| `--include-empty`  | Show empty entries, overriding configuration.        |
 
 ### Rendering
 
@@ -120,16 +122,18 @@ prs [path] [options]
 
 | Option                      | Description                                                                   |
 | --------------------------- | ----------------------------------------------------------------------------- |
-| `--scan-timeout <seconds>`  | Stop scanning after the given number of seconds and print the partial result. |
-| `--auto-copy <true\|false>` | Copy the scan output to the clipboard after scanning. Default: `false` in shipped config, `true` when no config file is found. |
+| `--scan-timeout <seconds>`  | Use a best-effort scan budget and print the partial result when exceeded. |
+| `--auto-copy <true\|false>` | Copy the scan output to the clipboard after scanning. Default: `false`. |
 
 ### Configuration
 
 | Option              | Description                           |
 | ------------------- | ------------------------------------- |
 | `--config <path>`   | Use a specific `config.yaml` file.    |
+| `--project-config <auto\|ignore\|require>` | Control project `.prs.yaml` or `prs.yaml` discovery. |
 | `--help`, `-h`      | Show help text and exit.              |
 | `--version`         | Show version number and exit.         |
+| `prs status`        | Show runtime, interpreter, and config status. |
 
 ### Notes
 
@@ -137,7 +141,7 @@ prs [path] [options]
 * When no command-line options are provided, `prs` uses `config.yaml`.
 * Command-line options override matching `config.yaml` values.
 * `--only` uses explicit CLI selectors and does not turn default ignored names into included names.
-* Config discovery precedence (highest first): `--config <path>` → `$PWD/config.yaml` → `$XDG_CONFIG_HOME/project-summarizer/config.yaml` (user config) → `$APP_DIR/config.yaml` (installed default) → built-in defaults. User config persists across installs and is never overwritten.
+* Config precedence (highest first): `--config <path>` → project `.prs.yaml` or `prs.yaml` → user config → managed `config.yaml` beside `prs.py` → built-in defaults. A generic project `config.yaml` is ignored. Use `--project-config ignore` for untrusted repositories. Project config cannot enable clipboard copying unless it is also supplied explicitly with `--config`. User config persists across installs and is never overwritten.
 * Selectors use per-category replacement: CLI `-n foo` replaces the config `names:` list rather than appending.
 
 ## Configuration file
@@ -217,7 +221,7 @@ When `tree` is omitted from scan-data, entries are shown as a flat list (no tree
 
 ## Git status markers
 
-Git markers appear when the scan path is inside a git repository.
+Git markers appear when the scan path is inside a git repository. For deterministic and non-interactive scans, PRS disables system/global Git configuration; markers therefore reflect repository-local ignore rules rather than personal global excludes.
 
 | Marker | Meaning   |
 | ------ | --------- |
@@ -225,11 +229,14 @@ Git markers appear when the scan path is inside a git repository.
 | `[A]`  | Added     |
 | `[D]`  | Deleted   |
 | `[R]`  | Renamed   |
+| `[C]`  | Copied    |
+| `[U]`  | Unmerged  |
 | `[?]`  | Untracked |
+| `[!]`  | Ignored   |
 
 ## Notes
 
-* When `--scan-timeout` is reached, `prs` stops scanning and prints the partial result with a timeout notice.
+* `--scan-timeout` is a best-effort budget checked around filesystem and Git operations; a blocking system call may return after the budget before the partial result is printed.
 * Empty entries are files with `0` bytes or directories with no scanned children.
 
 ## Exit codes
@@ -239,6 +246,7 @@ Git markers appear when the scan path is inside a git repository.
 | `0`  | Success                         |
 | `1`  | Runtime error (PrsError, OSError, clipboard failure) |
 | `2`  | Configuration error (ConfigError) |
+| `70` | Rollback could not fully restore; the prior backup path is preserved and reported |
 | `130`| Interrupted (`Ctrl+C`)          |
 
 ## License

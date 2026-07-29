@@ -1,0 +1,5 @@
+-r requirements-test.txt
+mypy==2.3.0
+pip-audit==2.10.1
+ruff==0.16.0
+shellcheck-py==0.11.0.1

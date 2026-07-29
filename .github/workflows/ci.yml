@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-test.txt
+
+      - name: Install quality tools
+        run: python -m pip install --disable-pip-version-check --requirement requirements-dev.txt
+
+      - name: Verify release metadata
+        run: python tools/verify_release.py
+
+      - name: Audit resolved development environment
+        run: python -m pip_audit --local --skip-editable --progress-spinner off
+
+      - name: Lint Python
+        run: python -m ruff check .
+
+      - name: Check Python formatting
+        run: python -m ruff format --check .
+
+      - name: Type-check runtime
+        run: python -m mypy
+
+      - name: Lint installer
+        run: shellcheck -x install.sh
+
+      - name: Lint workflow
+        run: >-
+          docker run --rm
+          --volume "$PWD:/repo:ro"
+          --workdir /repo
+          rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+
+  tests:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        python-version: ["3.10", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Install test tools
+        run: python -m pip install --disable-pip-version-check --requirement requirements-test.txt
+
+      - name: Run regression suite with branch coverage
+        run: |
+          python -m coverage run -m pytest
+          python -m coverage report
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [quality, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Verify release tag and metadata
+        id: release
+        run: |
+          version="$(python -S prs.py version | awk '{print $2}')"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            printf 'tag %s does not match runtime version v%s\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+          python tools/verify_release.py
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify reproducible release archive
+        run: |
+          python tools/build_release.py
+          (cd dist && sha256sum -c SHA256SUMS)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          "dist/project-summarizer-${VERSION}.tar.gz"
+          dist/SHA256SUMS
+          --verify-tag
+          --title "Project Summarizer ${VERSION}"
+          --generate-notes

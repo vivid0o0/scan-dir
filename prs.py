@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-# prs.py -- Project Summarizer scanner
-# Implements the prs project tree scanner with config-driven filters, metadata
-# rendering, git markers, and installer-safe runtime behavior.
+# prs.py -- Project Summarizer runtime
+# Scans a file or directory and renders deterministic project context with
+# configurable filtering, metadata, Git state, and safe terminal output.
+# Tags: cli, filesystem, git, rendering, configuration
+# 2026-07-28
 
 from __future__ import annotations
 
 import argparse
 import errno
+import itertools
 import math
 import os
 import re
@@ -16,19 +19,21 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator, Sequence
-
+from typing import Any, Literal, NoReturn, TextIO
 
 # ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
 PROGRAM_NAME = "prs"
 ALIAS_COMMAND = "project-summarizer"
 PRODUCT_TITLE = "Project Summarizer"
-VERSION = "2026.06.20.31"
+VERSION = "2026.07.29.2"
 CONFIG_FILE_NAME = "config.yaml"
+CONFIG_DIRECTORY_NAME = "project-summarizer"
+PROJECT_CONFIG_FILE_NAMES = (".prs.yaml", "prs.yaml")
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60.0
 ENTRY_TYPES = ("file", "dir", "link")
 # Emoji prefix shown next to entry names when scan_emojis is enabled.
@@ -80,6 +85,7 @@ HELP_DESCRIPTION_COLUMN_MIN_WIDTH = 20
 HELP_TABLE_COLUMN_OVERHEAD = 4
 NAME_COLUMN_MIN_WIDTH = 8
 TEXT_READ_CHUNK_SIZE = 64 * 1024
+CONFIG_MAX_BYTES = 1024 * 1024
 FILE_READ_MAX_ATTEMPTS = 2
 CLIPBOARD_TIMEOUT_SECONDS = 2.0
 GIT_TIMEOUT_CAP_SECONDS = 5.0
@@ -89,12 +95,7 @@ GIT_CONFIG_OVERRIDES = (
     "core.hooksPath=" + os.devnull,
     "core.pager=cat",
     "pager.status=false",
-)
-GIT_ENVIRONMENT_KEYS = (
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_EXTERNAL_DIFF", "GIT_DIFF_OPTS", "GIT_ATTR_SOURCE",
-    "GIT_CONFIG_PARAMETERS",
+    "status.renames=copies",
 )
 # git ls-tree HEAD exits 128 when HEAD does not exist (e.g., a freshly-init'd
 # repo with no commits). Treated as "no tree to recover metadata from" rather
@@ -114,15 +115,10 @@ ANSI_BLUE = "\033[34m"
 ANSI_MAGENTA = "\033[35m"
 ANSI_CYAN = "\033[36m"
 ANSI_WHITE = "\033[37m"
-ANSI_BRIGHT_RED = "\033[91m"
-ANSI_BRIGHT_GREEN = "\033[92m"
-ANSI_BRIGHT_YELLOW = "\033[93m"
-ANSI_BRIGHT_BLUE = "\033[94m"
-ANSI_BRIGHT_MAGENTA = "\033[95m"
-ANSI_BRIGHT_CYAN = "\033[96m"
 
 
 # ─── ERRORS ─────────────────────────────────────────────────────────────────
+
 
 class PrsError(Exception):
     pass
@@ -139,7 +135,6 @@ class HelpRequested(PrsError):
     this dedicated type so callers can render help instead of misreporting
     the exit as a config error.
     """
-    pass
 
 
 class ClipboardError(PrsError):
@@ -166,6 +161,7 @@ class ClipboardFailureError(ClipboardError):
 
 # ─── DATA MODELS ────────────────────────────────────────────────────────────
 
+
 @dataclass(frozen=True)
 class FilterRules:
     paths: tuple[str, ...] = ()
@@ -181,7 +177,7 @@ class FilterRules:
 @dataclass(frozen=True)
 class RuntimeConfig:
     root_path: Path
-    config_path: Path | None
+    config_paths: tuple[Path, ...]
     filter_mode: str
     rules: FilterRules
     ignore_hidden: bool
@@ -191,6 +187,10 @@ class RuntimeConfig:
     scan_data: frozenset[str]
     scan_timeout: float
     auto_copy: bool
+
+    @property
+    def config_path(self) -> Path | None:
+        return self.config_paths[-1] if self.config_paths else None
 
 
 @dataclass
@@ -216,7 +216,7 @@ class EntryNode:
     mtime: float
     lines: int | None = None
     target: str | None = None
-    children: list["EntryNode"] = field(default_factory=list)
+    children: list[EntryNode] = field(default_factory=list)
     total_files: int = 0
     total_dirs: int = 0
     total_links: int = 0
@@ -224,6 +224,7 @@ class EntryNode:
     unknown_lines: int = 0
     largest_file: tuple[str, int] | None = None
     newest_entry: tuple[str, float] | None = None
+    incomplete: bool = False
 
     @property
     def summary_path(self) -> str:
@@ -249,6 +250,7 @@ class ScanState:
     git_deadline: float | None = None
     timed_out: bool = False
     warnings: list[ScanWarning] = field(default_factory=list)
+    visited_directories: set[tuple[int, int]] = field(default_factory=set)
 
     def timeout_reached(self) -> bool:
         if time.monotonic() >= self.deadline:
@@ -264,24 +266,171 @@ class ScanState:
         return min(remaining, cap) if cap is not None else remaining
 
 
+# ─── CLI CONTRACT ───────────────────────────────────────────────────────────
+
+CliValueMode = Literal["flag", "single", "multiple"]
+
+
+@dataclass(frozen=True)
+class CliOptionSpec:
+    """Single source of truth for parsing and argv preprocessing.
+
+    The previous implementation repeated option names across several tables
+    and ``build_parser()``, so adding or renaming a flag could silently break
+    path extraction. Every parser and preprocessor lookup is now derived from
+    this immutable schema.
+    """
+
+    flags: tuple[str, ...]
+    dest: str
+    value_mode: CliValueMode
+    help: str
+    group: str = "general"
+    action: str | None = None
+    choices: tuple[str, ...] = ()
+    converter: Callable[[str], object] | None = None
+    const: object | None = None
+    default: object | None = None
+
+    @property
+    def canonical_flag(self) -> str:
+        return next((flag for flag in self.flags if flag.startswith("--")), self.flags[0])
+
+
+CLI_OPTION_SPECS: tuple[CliOptionSpec, ...] = (
+    CliOptionSpec(
+        ("--ignore",), "ignore", "flag", "exclude entries matching filters", group="mode", action="store_true"
+    ),
+    CliOptionSpec(
+        ("--only",), "only", "flag", "include only entries matching filters", group="mode", action="store_true"
+    ),
+    CliOptionSpec(
+        ("--full",),
+        "full",
+        "flag",
+        "include all entries, including hidden and empty entries",
+        group="mode",
+        action="store_true",
+    ),
+    CliOptionSpec(
+        ("-f", "--paths"),
+        "paths",
+        "multiple",
+        "match relative paths and matched directory contents",
+        group="selector",
+        action="append",
+    ),
+    CliOptionSpec(
+        ("-t", "--types"), "types", "multiple", "match entry types: file, dir, link", group="selector", action="append"
+    ),
+    CliOptionSpec(
+        ("-e", "--extensions"),
+        "extensions",
+        "multiple",
+        "match file extensions, such as .ts or .md",
+        group="selector",
+        action="append",
+    ),
+    CliOptionSpec(
+        ("-n", "--names"),
+        "names",
+        "multiple",
+        "match exact file or directory basenames",
+        group="selector",
+        action="append",
+    ),
+    CliOptionSpec(
+        ("--ignore-hidden",),
+        "ignore_hidden",
+        "flag",
+        "hide dot-prefixed files and directories",
+        group="hidden",
+        action="store_const",
+        const=True,
+        default=None,
+    ),
+    CliOptionSpec(
+        ("--include-hidden",),
+        "ignore_hidden",
+        "flag",
+        "show dot-prefixed files and directories",
+        group="hidden",
+        action="store_const",
+        const=False,
+        default=None,
+    ),
+    CliOptionSpec(
+        ("--ignore-empty",),
+        "ignore_empty",
+        "flag",
+        "hide empty files and directories",
+        group="empty",
+        action="store_const",
+        const=True,
+        default=None,
+    ),
+    CliOptionSpec(
+        ("--include-empty",),
+        "ignore_empty",
+        "flag",
+        "show empty files and directories",
+        group="empty",
+        action="store_const",
+        const=False,
+        default=None,
+    ),
+    CliOptionSpec(("--scan-styling",), "scan_styling", "single", "set output styling", choices=STYLING_LEVELS),
+    CliOptionSpec(("--scan-emojis",), "scan_emojis", "single", "show or hide emojis", choices=("true", "false")),
+    CliOptionSpec(("--scan-data",), "scan_data", "single", "comma-separated metadata items"),
+    CliOptionSpec(
+        ("--scan-timeout",), "scan_timeout", "single", "stop after seconds and print a partial result", converter=float
+    ),
+    CliOptionSpec(
+        ("--auto-copy",), "auto_copy", "single", "copy plain output to the clipboard", choices=("true", "false")
+    ),
+    CliOptionSpec(("--config",), "config", "single", "use a specific config.yaml file"),
+    CliOptionSpec(
+        ("--project-config",),
+        "project_config",
+        "single",
+        "control repository-owned configuration discovery",
+        choices=("auto", "ignore", "require"),
+        default="auto",
+    ),
+    CliOptionSpec(("--help", "-h"), "help", "flag", "show help", action="store_true"),
+    CliOptionSpec(("--version",), "version", "flag", "show version", action="store_true"),
+)
+
+OPTION_SPEC_BY_FLAG = {flag: spec for spec in CLI_OPTION_SPECS for flag in spec.flags}
+SHORTCUT_MODE_FLAGS = {"--ignore", "--only"}
+SELECTOR_ORDER = tuple(spec.canonical_flag for spec in CLI_OPTION_SPECS if spec.group == "selector")
+
+
 # ─── NORMALIZATION ──────────────────────────────────────────────────────────
 
+
 def sanitize_terminal_text(value: object) -> str:
+    """Return terminal-safe text without losing undecodable filename bytes.
+
+    Paths decoded by Python's ``surrogateescape`` retain original bytes in the
+    U+DC80..U+DCFF range. Render those as explicit ``\\xNN`` sequences rather
+    than replacing them with U+FFFD, so diagnostics remain unambiguous and
+    round-trippable for operators. Other control/surrogate characters are
+    escaped, while format and bidirectional controls are named visibly.
+    """
     text = os.fsdecode(value) if isinstance(value, bytes) else str(value)
-    if any(0xDC80 <= ord(char) <= 0xDCFF for char in text):
-        try:
-            raw_text = text.encode(sys.getfilesystemencoding(), "surrogateescape")
-        except UnicodeEncodeError:
-            raw_text = text.encode("utf-8", "surrogateescape")
-        text = raw_text.decode("utf-8", "replace")
     output: list[str] = []
     for char in text:
         codepoint = ord(char)
+        if 0xDC80 <= codepoint <= 0xDCFF:
+            output.append(f"\\x{codepoint - 0xDC00:02X}")
+            continue
         category = unicodedata.category(char)
-        if char == "\t":
-            output.append(" ")
-        elif char in {"\n", "\r"} or category in {"Cc", "Cs"}:
-            output.append(f"\\u{codepoint:04X}")
+        if category in {"Cc", "Cs"}:
+            if codepoint <= 0xFFFF:
+                output.append(f"\\u{codepoint:04X}")
+            else:
+                output.append(f"\\U{codepoint:08X}")
         elif category == "Cf" or 0x202A <= codepoint <= 0x202E or 0x2066 <= codepoint <= 0x2069:
             output.append(f"<U+{codepoint:04X}>")
         else:
@@ -293,9 +442,7 @@ def expand_user_path(value: str | os.PathLike[str], description: str) -> Path:
     try:
         return Path(value).expanduser()
     except (KeyError, RuntimeError, ValueError) as exc:
-        raise ConfigError(
-            f"unable to expand {description}: {sanitize_terminal_text(value)}"
-        ) from exc
+        raise ConfigError(f"unable to expand {description}: {sanitize_terminal_text(value)}") from exc
 
 
 def resolve_scan_path(value: str) -> Path:
@@ -310,10 +457,22 @@ def resolve_scan_path(value: str) -> Path:
     return Path(os.path.abspath(expanded))
 
 
-ASCII_TRANSLATION = str.maketrans({
-    "─": "-", "│": "|", "├": "+", "└": "`", "┌": "+", "┐": "+",
-    "┬": "+", "┤": "+", "┘": "+", "┴": "+", "→": "->", "…": ".",
-})
+ASCII_TRANSLATION = str.maketrans(
+    {
+        "─": "-",
+        "│": "|",
+        "├": "+",
+        "└": "`",
+        "┌": "+",
+        "┐": "+",
+        "┬": "+",
+        "┤": "+",
+        "┘": "+",
+        "┴": "+",
+        "→": "->",
+        "…": ".",
+    }
+)
 
 
 def ascii_terminal_text(text: str) -> str:
@@ -324,16 +483,20 @@ def ascii_terminal_text(text: str) -> str:
             output.append(char)
         elif char == "\ufffd":
             output.append("?")
-        elif unicodedata.combining(char):
-            continue
-        elif unicodedata.category(char) in {"Cf", "Mn", "Me", "So", "Sk"}:
+        elif unicodedata.combining(char) or unicodedata.category(char) in {
+            "Cf",
+            "Mn",
+            "Me",
+            "So",
+            "Sk",
+        }:
             continue
         else:
             output.append("?")
     return "".join(output)
 
 
-def stream_text(stream: object, text: str) -> str:
+def stream_text(stream: TextIO, text: str) -> str:
     encoding = getattr(stream, "encoding", None)
     if not encoding:
         return text
@@ -344,22 +507,34 @@ def stream_text(stream: object, text: str) -> str:
     return text
 
 
-def write_stream(stream: object, text: str) -> None:
+def write_stream(stream: TextIO, text: str) -> None:
     stream.write(stream_text(stream, text))
     stream.flush()
 
+
 def normalize_selector_path(value: str) -> str:
+    """Normalize a relative selector without rewriting valid POSIX names."""
     if value == ".":
         return "."
+    if not value:
+        raise ConfigError("path filters cannot contain an empty value")
     normalized = value
     if os.sep != "/":
         normalized = normalized.replace(os.sep, "/")
     if os.altsep and os.altsep != "/":
         normalized = normalized.replace(os.altsep, "/")
-    while normalized.startswith("./"):
-        normalized = normalized[2:]
-    normalized = normalized.strip("/")
-    return normalized
+    if normalized.startswith("/"):
+        raise ConfigError(f"path filters must be relative: {sanitize_terminal_text(value)}")
+    parts: list[str] = []
+    for part in normalized.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ConfigError(f"path filters cannot traverse above the scan root: {sanitize_terminal_text(value)}")
+        parts.append(part)
+    if not parts:
+        return "."
+    return "/".join(parts)
 
 
 def git_path_identity(value: str) -> str:
@@ -367,19 +542,19 @@ def git_path_identity(value: str) -> str:
 
 
 def normalize_extension(value: str) -> str:
-    extension = value.strip().lower()
+    extension = value.lower()
     if not extension.startswith("."):
-        raise ConfigError(f"extension filters must include the leading dot: {value}")
+        raise ConfigError(f"extension filters must include the leading dot: {sanitize_terminal_text(value)}")
     if extension == ".":
         raise ConfigError("extension filter cannot be only '.'")
     return extension
 
 
 def normalize_entry_type(value: str) -> str:
-    entry_type = value.strip().lower()
+    entry_type = value.lower()
     if entry_type not in ENTRY_TYPES:
         joined = ", ".join(ENTRY_TYPES)
-        raise ConfigError(f"invalid entry type '{value}', expected one of: {joined}")
+        raise ConfigError(f"invalid entry type '{sanitize_terminal_text(value)}', expected one of: {joined}")
     return entry_type
 
 
@@ -396,7 +571,7 @@ def normalize_bool(value: object, key: str) -> bool:
 
 
 def normalize_float(value: object, key: str) -> float:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         raise ConfigError(f"{key} must be a number")
     try:
         number = float(value)
@@ -410,39 +585,29 @@ def normalize_float(value: object, key: str) -> float:
 def normalize_choice(value: object, key: str, choices: Sequence[str]) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"{key} must be one of: {', '.join(choices)}")
-    normalized = value.strip().lower()
+    normalized = value.lower()
     if normalized not in choices:
         raise ConfigError(f"{key} must be one of: {', '.join(choices)}")
     return normalized
 
 
 def normalize_scan_data(value: object, key: str = "scan_data") -> frozenset[str]:
-    """Parse a scan_data string into a frozenset of item names.
-
-    Accepts a comma-separated string like 'Tree, lines count, size, last
-    modified, type, git marker, summary' and returns a frozenset of
-    canonical item names from SCAN_DATA_ITEMS. Each comma-separated entry
-    must contain at least one whitespace-separated word that exactly
-    matches (case-insensitively) a canonical item name. This allows
-    human-friendly variants like 'lines count' (matches 'lines'), 'last
-    modified' (matches 'modified'), 'git marker' (matches 'git'), while
-    rejecting plurals, typos, and unknown items with a ConfigError.
-    """
+    """Parse a non-empty comma-separated set of exact metadata names."""
     if not isinstance(value, str):
         raise ConfigError(f"{key} must be a string")
     items: set[str] = set()
     for raw_item in value.split(","):
-        item = raw_item.strip().lower().rstrip(".")
+        item = raw_item.strip().lower()
         if not item:
             continue
-        matched = False
-        for canonical in SCAN_DATA_ITEMS:
-            if canonical in item.split():
-                items.add(canonical)
-                matched = True
-                break
-        if not matched:
-            raise ConfigError(f"{key} contains unknown item '{raw_item.strip()}'; valid items: {', '.join(SCAN_DATA_ITEMS)}")
+        if item not in SCAN_DATA_ITEMS:
+            raise ConfigError(
+                f"{key} contains unknown item '{sanitize_terminal_text(raw_item.strip())}'; "
+                f"valid items: {', '.join(SCAN_DATA_ITEMS)}"
+            )
+        items.add(item)
+    if not items:
+        raise ConfigError(f"{key} must select at least one item: {', '.join(SCAN_DATA_ITEMS)}")
     return frozenset(items)
 
 
@@ -464,8 +629,6 @@ def normalize_rules(payload: dict[str, object]) -> FilterRules:
     raw_types = normalize_list(payload.get("types"), "types")
     raw_extensions = normalize_list(payload.get("extensions"), "extensions")
     raw_names = normalize_list(payload.get("names"), "names")
-    if any(item == "" for item in raw_paths):
-        raise ConfigError("path filters cannot contain an empty value")
     if any(item == "" for item in raw_names):
         raise ConfigError("name filters cannot contain an empty value")
     return FilterRules(
@@ -477,6 +640,7 @@ def normalize_rules(payload: dict[str, object]) -> FilterRules:
 
 
 # ─── CONFIG LOADING ─────────────────────────────────────────────────────────
+
 
 def default_payload() -> dict[str, object]:
     return {
@@ -490,283 +654,495 @@ def default_payload() -> dict[str, object]:
         "scan_emojis": True,
         "scan_data": SCAN_DATA_DEFAULT,
         "scan_timeout": DEFAULT_SCAN_TIMEOUT_SECONDS,
-        "auto_copy": True,
+        "auto_copy": False,
     }
 
 
-def _strip_yaml_comment(value: str) -> str:
-    """Remove a trailing inline YAML comment while honoring quotes."""
-    in_single = False
-    in_double = False
-    for index, char in enumerate(value):
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        elif char == "#" and not in_single and not in_double:
-            if index == 0 or value[index - 1].isspace():
+def _yaml_error(source: Path, line_number: int, message: str) -> ConfigError:
+    return ConfigError(f"config file {sanitize_terminal_text(source)} line {line_number}: {message}")
+
+
+def _strip_yaml_comment(value: str, source: Path, line_number: int) -> str:
+    """Remove an inline YAML comment and validate quote termination."""
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if char == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    index += 1
+                else:
+                    quote = None
+        else:
+            if char in {'"', "'"}:
+                quote = char
+            elif char == "#" and (index == 0 or value[index - 1].isspace()):
                 return value[:index]
+        index += 1
+    if quote is not None or escaped:
+        raise _yaml_error(source, line_number, "unterminated quoted string")
     return value
 
 
-def _unescape_yaml_double_quoted(inner: str) -> str:
-    r"""Unescape a YAML double-quoted string body.
-
-    Handles the escape sequences defined by the YAML spec (\n, \t, \r, \",
-    \\, \/, \uXXXX, \xXX) while leaving all other characters (including
-    multi-byte UTF-8) untouched. Using str.encode/decode with
-    "unicode_escape" mangles non-ASCII content, so the unescape is performed
-    one character at a time on the unicode string.
-    """
+def _unescape_yaml_double_quoted(inner: str, source: Path, line_number: int) -> str:
     output: list[str] = []
     index = 0
-    length = len(inner)
-    hex_digits = "0123456789abcdefABCDEF"
-    while index < length:
+    simple = {
+        "0": "\0",
+        "a": "\a",
+        "b": "\b",
+        "t": "\t",
+        "n": "\n",
+        "v": "\v",
+        "f": "\f",
+        "r": "\r",
+        "e": "\x1b",
+        " ": " ",
+        '"': '"',
+        "/": "/",
+        "\\": "\\",
+        "N": "\u0085",
+        "_": "\u00a0",
+        "L": "\u2028",
+        "P": "\u2029",
+    }
+    while index < len(inner):
         char = inner[index]
-        if char != "\\" or index == length - 1:
+        if char == '"':
+            raise _yaml_error(source, line_number, "unescaped double quote in double-quoted string")
+        if char != "\\":
             output.append(char)
             index += 1
             continue
-        next_char = inner[index + 1]
-        simple = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/"}
-        if next_char in simple:
-            output.append(simple[next_char])
+        if index + 1 >= len(inner):
+            raise _yaml_error(source, line_number, "trailing backslash in double-quoted string")
+        marker = inner[index + 1]
+        if marker in simple:
+            output.append(simple[marker])
             index += 2
             continue
-        if next_char == "u":
-            escape = inner[index + 2 : index + 6]
-            if len(escape) == 4 and all(ch in hex_digits for ch in escape):
-                output.append(chr(int(escape, 16)))
-                index += 6
-                continue
-        if next_char == "x":
-            escape = inner[index + 2 : index + 4]
-            if len(escape) == 2 and all(ch in hex_digits for ch in escape):
-                output.append(chr(int(escape, 16)))
-                index += 4
-                continue
-        # Unknown or malformed escape: preserve the backslash literally so
-        # the value remains observable rather than silently rewritten.
-        output.append(char)
-        index += 1
+        lengths = {"x": 2, "u": 4, "U": 8}
+        if marker in lengths:
+            length = lengths[marker]
+            digits = inner[index + 2 : index + 2 + length]
+            if len(digits) != length or not re.fullmatch(r"[0-9A-Fa-f]+", digits):
+                raise _yaml_error(source, line_number, f"invalid \\{marker} escape")
+            codepoint = int(digits, 16)
+            if codepoint > 0x10FFFF or 0xD800 <= codepoint <= 0xDFFF:
+                raise _yaml_error(source, line_number, "invalid Unicode code point in escape")
+            output.append(chr(codepoint))
+            index += 2 + length
+            continue
+        raise _yaml_error(source, line_number, f"unsupported escape sequence \\{sanitize_terminal_text(marker)}")
     return "".join(output)
 
 
-def _parse_yaml_scalar(raw: str) -> object:
-    """Convert a YAML scalar literal into the matching Python value."""
+def _parse_single_quoted(inner: str, source: Path, line_number: int) -> str:
+    output: list[str] = []
+    index = 0
+    while index < len(inner):
+        if inner[index] != "'":
+            output.append(inner[index])
+            index += 1
+            continue
+        if index + 1 < len(inner) and inner[index + 1] == "'":
+            output.append("'")
+            index += 2
+            continue
+        raise _yaml_error(source, line_number, "single quotes inside a single-quoted string must be doubled")
+    return "".join(output)
+
+
+def _parse_yaml_scalar(raw: str, source: Path, line_number: int) -> object:
     text = raw.strip()
     if not text:
         return ""
-    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
-        if len(text) >= 2:
-            quote = text[0]
-            inner = text[1:-1]
-            if quote == '"':
-                return _unescape_yaml_double_quoted(inner)
-            return inner.replace("''", "'")
+    if text.startswith('"'):
+        if len(text) < 2 or not text.endswith('"'):
+            raise _yaml_error(source, line_number, "unterminated double-quoted string")
+        return _unescape_yaml_double_quoted(text[1:-1], source, line_number)
+    if text.startswith("'"):
+        if len(text) < 2 or not text.endswith("'"):
+            raise _yaml_error(source, line_number, "unterminated single-quoted string")
+        return _parse_single_quoted(text[1:-1], source, line_number)
     lowered = text.lower()
     if lowered in {"true", "yes", "on"}:
         return True
     if lowered in {"false", "no", "off"}:
         return False
-    if lowered in {"null", "~", "none"}:
+    if lowered in {"null", "~"}:
         return None
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        number = float(text)
-        if math.isfinite(number):
-            return number
-    except ValueError:
-        pass
+    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9]*)", text):
+        try:
+            return int(text, 10)
+        except ValueError:
+            pass
+    if re.fullmatch(r"[-+]?(?:(?:[0-9]+\.[0-9]*)|(?:[0-9]*\.[0-9]+)|(?:[0-9]+))(?:[eE][-+]?[0-9]+)?", text):
+        try:
+            number = float(text)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(number):
+                return number
     return text
 
 
-def _parse_yaml_inline_list(value: str) -> list[object]:
-    """Parse a `[a, b, c]` flow sequence that has already been stripped of brackets."""
+def _parse_yaml_inline_list(value: str, source: Path, line_number: int) -> list[object]:
+    if not (value.startswith("[") and value.endswith("]")):
+        raise _yaml_error(source, line_number, "malformed inline list")
+    inner = value[1:-1]
+    if not inner.strip():
+        return []
     items: list[object] = []
-    buffer = ""
-    in_single = False
-    in_double = False
-    for char in value:
-        if char == "'" and not in_double:
-            in_single = not in_single
-            buffer += char
-        elif char == '"' and not in_single:
-            in_double = not in_double
-            buffer += char
-        elif char == "," and not in_single and not in_double:
-            items.append(_parse_yaml_scalar(buffer))
-            buffer = ""
+    start = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(inner):
+        char = inner[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quote = None
+        elif quote == "'":
+            if char == "'":
+                if index + 1 < len(inner) and inner[index + 1] == "'":
+                    index += 1
+                else:
+                    quote = None
         else:
-            buffer += char
-    if buffer.strip():
-        items.append(_parse_yaml_scalar(buffer))
+            if char in {'"', "'"}:
+                quote = char
+            elif char in "[{":
+                raise _yaml_error(source, line_number, "nested inline collections are not supported")
+            elif char in "]}":
+                raise _yaml_error(source, line_number, "unexpected closing collection delimiter")
+            elif char == ",":
+                item = inner[start:index]
+                if not item.strip():
+                    raise _yaml_error(source, line_number, "inline lists cannot contain empty items")
+                items.append(_parse_yaml_scalar(item, source, line_number))
+                start = index + 1
+        index += 1
+    if quote is not None or escaped:
+        raise _yaml_error(source, line_number, "unterminated quoted string in inline list")
+    final = inner[start:]
+    if not final.strip():
+        raise _yaml_error(source, line_number, "inline lists cannot end with a comma")
+    items.append(_parse_yaml_scalar(final, source, line_number))
     return items
 
 
 def parse_config_yaml(text: str, source: Path) -> dict[str, object]:
-    """Parse the YAML subset supported by config.yaml without external deps.
-
-    Supports top-level mappings, scalar literals (bool/int/float/string/null),
-    inline flow lists (`[]` and `[a, b]`), block lists (`- item`), `#` comments
-    (full-line and trailing), and single- or double-quoted strings. Duplicate
-    keys are rejected. The grammar is intentionally restricted to the config
-    schema documented in README.md so the runtime remains self-contained.
-    """
+    """Parse the documented top-level YAML subset without external packages."""
     lines = text.splitlines()
     mapping: dict[str, object] = {}
     index = 0
     while index < len(lines):
         raw_line = lines[index]
+        line_number = index + 1
         index += 1
+        if "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip())]:
+            raise _yaml_error(source, line_number, "tabs are not allowed for indentation")
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        key_part = _strip_yaml_comment(raw_line).rstrip()
-        if not key_part.strip():
+        if raw_line[:1].isspace():
+            raise _yaml_error(source, line_number, "unexpected indentation at top level")
+        key_line = _strip_yaml_comment(raw_line, source, line_number).rstrip()
+        if not key_line:
             continue
-        if key_part.lstrip().startswith("- "):
-            raise ConfigError(f"config file {source} is not a mapping: top-level list entry")
-        if ":" not in key_part:
-            raise ConfigError(f"config file {source}: invalid line: {sanitize_terminal_text(stripped)}")
-        key, _, value = key_part.partition(":")
+        if key_line in {"---", "..."} or key_line.startswith("%YAML"):
+            raise _yaml_error(source, line_number, "YAML directives and document markers are not supported")
+        if ":" not in key_line:
+            raise _yaml_error(source, line_number, f"invalid mapping entry: {sanitize_terminal_text(stripped)}")
+        key, _, raw_value = key_line.partition(":")
         key = key.strip()
-        if not key:
-            raise ConfigError(f"config file {source}: empty mapping key on line: {sanitize_terminal_text(stripped)}")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", key):
+            raise _yaml_error(source, line_number, f"invalid mapping key: {sanitize_terminal_text(key)}")
         if key in mapping:
-            raise ConfigError(f"duplicate YAML key '{key}'")
-        value = value.strip()
-        if not value:
-            if index < len(lines):
-                lookahead = lines[index]
-                lookahead_stripped = lookahead.strip()
-                if lookahead_stripped.startswith("- ") or lookahead_stripped == "-":
-                    items: list[object] = []
-                    while index < len(lines):
-                        item_line = lines[index]
-                        item_stripped = item_line.strip()
-                        if not item_stripped or item_stripped.startswith("#"):
-                            index += 1
-                            continue
-                        if not (item_stripped.startswith("- ") or item_stripped == "-"):
-                            break
-                        item_body = item_stripped[1:].strip()
-                        if item_body:
-                            items.append(_parse_yaml_scalar(item_body))
-                        index += 1
-                    mapping[key] = items
-                    continue
-            mapping[key] = None
+            raise _yaml_error(source, line_number, f"duplicate YAML key '{key}'")
+        value = raw_value.strip()
+        if value:
+            if value.startswith("[") or value.endswith("]"):
+                mapping[key] = _parse_yaml_inline_list(value, source, line_number)
+            elif value.startswith("{") or value.endswith("}"):
+                raise _yaml_error(source, line_number, "inline mappings are not supported")
+            else:
+                mapping[key] = _parse_yaml_scalar(value, source, line_number)
             continue
-        if value.startswith("[") and value.endswith("]"):
-            inner = value[1:-1].strip()
-            mapping[key] = _parse_yaml_inline_list(inner) if inner else []
-            continue
-        if value.startswith("{") and value.endswith("}"):
-            raise ConfigError(f"config file {source}: inline mappings are not supported (key '{key}')")
-        mapping[key] = _parse_yaml_scalar(value)
+
+        items: list[object] = []
+        list_indent: int | None = None
+        while index < len(lines):
+            item_raw = lines[index]
+            item_line_number = index + 1
+            if "\t" in item_raw[: len(item_raw) - len(item_raw.lstrip())]:
+                raise _yaml_error(source, item_line_number, "tabs are not allowed for indentation")
+            item_stripped = item_raw.strip()
+            if not item_stripped or item_stripped.startswith("#"):
+                index += 1
+                continue
+            indent = len(item_raw) - len(item_raw.lstrip(" "))
+            if indent == 0:
+                break
+            if list_indent is None:
+                list_indent = indent
+                if list_indent < 2:
+                    raise _yaml_error(
+                        source, item_line_number, "block list items must be indented by at least two spaces"
+                    )
+            if indent != list_indent:
+                raise _yaml_error(source, item_line_number, "inconsistent block-list indentation")
+            body = item_raw[indent:]
+            if not (body == "-" or body.startswith("- ")):
+                raise _yaml_error(source, item_line_number, "only block-list items are allowed below a key")
+            item_text = _strip_yaml_comment(body[1:].lstrip(), source, item_line_number).rstrip()
+            if not item_text:
+                raise _yaml_error(source, item_line_number, "block lists cannot contain empty items")
+            items.append(_parse_yaml_scalar(item_text, source, item_line_number))
+            index += 1
+        mapping[key] = items if list_indent is not None else None
     return mapping
 
 
 def load_yaml_payload(path: Path) -> dict[str, object]:
+    file_fd: int | None = None
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            text = handle.read()
-    except UnicodeError as exc:
-        raise ConfigError(
-            f"config file is not valid UTF-8: {sanitize_terminal_text(path)}"
-        ) from exc
-    except OSError as exc:
-        raise ConfigError(f"unable to read config file: {sanitize_terminal_text(path)}") from exc
-
-    try:
-        loaded = parse_config_yaml(text, path)
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        file_fd = os.open(path, flags)
+        opened_stat = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
+            raise ConfigError(f"config file is not a regular file: {sanitize_terminal_text(path)}")
+        if opened_stat.st_size > CONFIG_MAX_BYTES:
+            raise ConfigError(f"config file exceeds {CONFIG_MAX_BYTES} bytes: {sanitize_terminal_text(path)}")
+        chunks: list[bytes] = []
+        total = 0
+        while total <= CONFIG_MAX_BYTES:
+            chunk = os.read(file_fd, min(TEXT_READ_CHUNK_SIZE, CONFIG_MAX_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total > CONFIG_MAX_BYTES:
+            raise ConfigError(f"config file exceeds {CONFIG_MAX_BYTES} bytes: {sanitize_terminal_text(path)}")
+        after_stat = os.fstat(file_fd)
+        current_stat = os.stat(path, follow_symlinks=False)
+        before_signature = (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+            opened_stat.st_mode,
+            opened_stat.st_size,
+            opened_stat.st_mtime_ns,
+            opened_stat.st_ctime_ns,
+        )
+        after_signature = (
+            after_stat.st_dev,
+            after_stat.st_ino,
+            after_stat.st_mode,
+            after_stat.st_size,
+            after_stat.st_mtime_ns,
+            after_stat.st_ctime_ns,
+        )
+        current_signature = (
+            current_stat.st_dev,
+            current_stat.st_ino,
+            current_stat.st_mode,
+            current_stat.st_size,
+            current_stat.st_mtime_ns,
+            current_stat.st_ctime_ns,
+        )
+        if before_signature != after_signature or after_signature != current_signature:
+            raise ConfigError(f"config file changed while being read: {sanitize_terminal_text(path)}")
+        raw = b"".join(chunks)
     except ConfigError:
         raise
-    except Exception as exc:
-        raise ConfigError(f"unable to parse config file: {sanitize_terminal_text(path)}: {exc}") from exc
-
-    if not isinstance(loaded, dict):
-        raise ConfigError(f"config file must contain a YAML mapping: {path}")
-    return dict(loaded)
-
-
-def find_config_path(explicit_path: str | None, root_path: Path) -> Path | None:
-    if explicit_path is not None:
-        path = expand_user_path(explicit_path, "config path")
-        if not path.exists():
-            raise ConfigError(f"config file does not exist: {path}")
-        if not path.is_file():
-            raise ConfigError(f"config path is not a file: {path}")
-        return path
-    # Project-local config: next to the scan root (or its parent when the
-    # root is a file). `is_dir()` follows symlinks so a symlinked directory's
-    # config is picked up correctly.
-    if root_path.is_dir():
-        candidate = root_path / CONFIG_FILE_NAME
-    else:
-        candidate = root_path.parent / CONFIG_FILE_NAME
-    if candidate.is_file():
-        return candidate
-    # User-level config: XDG_CONFIG_HOME or ~/.config. Persists across
-    # installs and is user-owned (never overwritten by the installer).
+    except OSError as exc:
+        raise ConfigError(
+            f"unable to read config file safely: {sanitize_terminal_text(path)}: {sanitize_terminal_text(exc)}"
+        ) from exc
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
     try:
-        xdg_base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+        decoded = raw.decode("utf-8-sig")
+    except UnicodeError as exc:
+        raise ConfigError(f"config file is not valid UTF-8: {sanitize_terminal_text(path)}") from exc
+    return parse_config_yaml(decoded, path)
+
+
+def user_config_path() -> Path | None:
+    explicit_dir = os.environ.get("PRS_CONFIG_DIR")
+    if explicit_dir:
+        candidate = expand_user_path(explicit_dir, "PRS_CONFIG_DIR")
+        if not candidate.is_absolute():
+            raise ConfigError(f"PRS_CONFIG_DIR must be absolute: {sanitize_terminal_text(explicit_dir)}")
+        return candidate / CONFIG_FILE_NAME
+
+    xdg_home = os.environ.get("XDG_CONFIG_HOME")
+    if xdg_home:
+        xdg_path = expand_user_path(xdg_home, "XDG_CONFIG_HOME")
+        if xdg_path.is_absolute():
+            return xdg_path / CONFIG_DIRECTORY_NAME / CONFIG_FILE_NAME
+
+    try:
+        home = Path.home()
     except RuntimeError:
-        xdg_base = ""
-    if xdg_base:
-        xdg_config = Path(xdg_base) / "project-summarizer" / CONFIG_FILE_NAME
-        if xdg_config.is_file():
-            return xdg_config
-    # Global installed config: next to the prs.py runtime. Supports layered
-    # defaults (project-local > user > installed > built-in defaults).
-    app_dir_config = Path(__file__).resolve().parent / CONFIG_FILE_NAME
-    if app_dir_config.is_file():
-        return app_dir_config
-    return None
+        return None
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / CONFIG_DIRECTORY_NAME / "config" / CONFIG_FILE_NAME
+    return home / ".config" / CONFIG_DIRECTORY_NAME / CONFIG_FILE_NAME
 
 
-def config_from_payload(payload: dict[str, object]) -> dict[str, object]:
-    # Accept both kebab-case (as documented in README.md and shipped in
-    # config.yaml) and snake_case (as mentioned in SKILL.md) by normalizing
-    # hyphens to underscores before lookup. Two originals that collapse onto
-    # the same canonical key (e.g., "scan-styling" and "scan_styling" in the
-    # same file) is a configuration error rather than a silent last-wins.
-    merged = default_payload()
+def _config_candidate(path: Path, label: str, required: bool = False) -> Path | None:
+    if not os.path.lexists(path):
+        if required:
+            raise ConfigError(f"{label} does not exist: {sanitize_terminal_text(path)}")
+        return None
+    if not path.is_file():
+        raise ConfigError(f"{label} is not a regular file: {sanitize_terminal_text(path)}")
+    return path
+
+
+def _append_unique_config(paths: list[Path], candidate: Path | None) -> None:
+    if candidate is None:
+        return
+    identity = os.path.realpath(candidate)
+    if any(os.path.realpath(existing) == identity for existing in paths):
+        return
+    paths.append(candidate)
+
+
+def project_config_path(root_path: Path) -> Path | None:
+    directory = root_path if root_path.is_dir() else root_path.parent
+    existing = [
+        candidate
+        for name in PROJECT_CONFIG_FILE_NAMES
+        if (candidate := _config_candidate(directory / name, "project config")) is not None
+    ]
+    if len(existing) > 1:
+        names = ", ".join(path.name for path in existing)
+        raise ConfigError(f"multiple project configuration files found in {sanitize_terminal_text(directory)}: {names}")
+    return existing[0] if existing else None
+
+
+def selected_project_config_path(root_path: Path, mode: str) -> Path | None:
+    if mode == "ignore":
+        return None
+    project = project_config_path(root_path)
+    if mode == "require" and project is None:
+        directory = root_path if root_path.is_dir() else root_path.parent
+        expected = " or ".join(PROJECT_CONFIG_FILE_NAMES)
+        raise ConfigError(
+            f"project configuration is required but {expected} was not found in {sanitize_terminal_text(directory)}"
+        )
+    return project
+
+
+def config_paths_with_project(
+    explicit_path: str | None,
+    project_path: Path | None,
+) -> tuple[Path, ...]:
+    """Return configuration layers from lowest to highest precedence."""
+    paths: list[Path] = []
+    managed = _config_candidate(Path(__file__).resolve().parent / CONFIG_FILE_NAME, "managed config")
+    _append_unique_config(paths, managed)
+    user_path = user_config_path()
+    if user_path is not None:
+        _append_unique_config(paths, _config_candidate(user_path, "user config"))
+    _append_unique_config(paths, project_path)
+    if explicit_path is not None:
+        explicit = expand_user_path(explicit_path, "config path")
+        _append_unique_config(paths, _config_candidate(explicit, "explicit config", required=True))
+    return tuple(paths)
+
+
+def find_config_paths(
+    explicit_path: str | None,
+    root_path: Path,
+    project_config_mode: str = "auto",
+) -> tuple[Path, ...]:
+    project_path = selected_project_config_path(root_path, project_config_mode)
+    return config_paths_with_project(explicit_path, project_path)
+
+
+def canonicalize_config_payload(payload: dict[str, object], source: Path) -> dict[str, object]:
+    allowed = default_payload()
+    result: dict[str, object] = {}
     canonical_to_original: dict[str, str] = {}
     for key, value in payload.items():
         normalized = key.replace("-", "_")
-        if normalized not in merged:
-            raise ConfigError(f"unknown config key: {key}")
+        if normalized not in allowed:
+            raise ConfigError(f"unknown config key in {sanitize_terminal_text(source)}: {sanitize_terminal_text(key)}")
         if normalized in canonical_to_original:
             raise ConfigError(
-                f"config key collision: both '{canonical_to_original[normalized]}' and '{key}' map to '{normalized}'"
+                f"config key collision in {sanitize_terminal_text(source)}: both "
+                f"'{canonical_to_original[normalized]}' and '{key}' map to '{normalized}'"
             )
         canonical_to_original[normalized] = key
-        merged[normalized] = value
+        result[normalized] = value
+    return result
+
+
+def merged_config_payload(
+    paths: Sequence[Path],
+    restricted_auto_copy_path: Path | None = None,
+) -> dict[str, object]:
+    merged = default_payload()
+    restricted_identity = os.path.realpath(restricted_auto_copy_path) if restricted_auto_copy_path is not None else None
+    for path in paths:
+        payload = canonicalize_config_payload(load_yaml_payload(path), path)
+        if restricted_identity is not None and os.path.realpath(path) == restricted_identity:
+            payload.pop("auto_copy", None)
+        merged.update(payload)
     return merged
 
 
 def is_help_token(value: str) -> bool:
-    return value in {"help", "-h", "--help"}
+    return value == "help"
 
 
 def is_version_token(value: str) -> bool:
-    return value in {"version", "--version"}
+    return value == "version"
 
 
 def is_status_token(value: str) -> bool:
     return value == "status"
 
 
+def option_before_separator(argv: Sequence[str], options: set[str]) -> bool:
+    """Return whether an exact flag appears before the path separator.
+
+    Attached forms such as ``--help=value`` are deliberately not accepted for
+    no-value flags; they must reach normal parsing so a usage error is emitted.
+    """
+    for token in argv:
+        if token == "--":
+            return False
+        if token in options:
+            return True
+    return False
+
+
 def render_status(color: bool | None = None) -> str:
     color = terminal_color_enabled() if color is None else color
-    cwd_config = find_config_path(None, Path.cwd())
-    config_text = sanitize_terminal_text(cwd_config) if cwd_config is not None else "not found (checked: project dir, user config, app dir)"
+    cwd_configs = find_config_paths(None, Path.cwd())
+    config_text = " -> ".join(sanitize_terminal_text(path) for path in cwd_configs)
+    if not config_text:
+        config_text = "built-in defaults only"
     # APP_DIR is the directory containing the prs executable that the user
     # actually invoked, falling back to the source file location when the
     # interpreter was started without an argv[0] (e.g., embedded runs).
@@ -783,17 +1159,28 @@ def render_status(color: bool | None = None) -> str:
         ("python", sys.executable),
         ("config", config_text),
     )
+    width = terminal_columns()
     label_width = max(len(label) for label, _ in rows)
-    rule = "─" * min(terminal_columns(), BANNER_RULE_WIDTH_MAXIMUM)
-    lines = [
-        style(f"{PRODUCT_TITLE} status", ANSI_CYAN, ANSI_BOLD, enabled=color),
-        style(rule, ANSI_DIM, ANSI_CYAN, enabled=color),
-    ]
+    rule = "─" * min(width, BANNER_RULE_WIDTH_MAXIMUM)
+    lines = help_wrapped_lines(
+        f"{PRODUCT_TITLE} status",
+        color,
+        ANSI_CYAN,
+        ANSI_BOLD,
+    )
+    lines.append(style(rule, ANSI_DIM, ANSI_CYAN, enabled=color))
     for label, value in rows:
-        lines.append(
-            f"  {style(pad_cells(label, label_width), ANSI_BLUE, ANSI_BOLD, enabled=color)}  "
-            f"{style(sanitize_terminal_text(value), ANSI_WHITE, enabled=color)}"
-        )
+        value = sanitize_terminal_text(value)
+        prefix_text = f"  {pad_cells(label, label_width)}  "
+        prefix_width = cell_width(prefix_text)
+        if prefix_width >= width:
+            lines.extend(help_wrapped_lines(f"{label}: {value}", color, ANSI_WHITE))
+            continue
+        value_chunks = wrap_cells(value, width - prefix_width)
+        styled_prefix = "  " + style(pad_cells(label, label_width), ANSI_BLUE, ANSI_BOLD, enabled=color) + "  "
+        lines.append(styled_prefix + style(value_chunks[0], ANSI_WHITE, enabled=color))
+        continuation = " " * prefix_width
+        lines.extend(continuation + style(chunk, ANSI_WHITE, enabled=color) for chunk in value_chunks[1:])
     return "\n".join(lines) + "\n"
 
 
@@ -803,10 +1190,10 @@ def render_version(color: bool | None = None) -> str:
 
 
 class PrsArgumentParser(argparse.ArgumentParser):
-    def error(self, message: str) -> None:
+    def error(self, message: str) -> NoReturn:
         raise ConfigError(message)
 
-    def exit(self, status: int = 0, message: str | None = None) -> None:
+    def exit(self, status: int = 0, message: str | None = None) -> NoReturn:
         # argparse calls exit(0) when a help action fires; raise a dedicated
         # type so callers can render help instead of misreporting the exit
         # as a config error. status!=0 always originates from error().
@@ -816,6 +1203,7 @@ class PrsArgumentParser(argparse.ArgumentParser):
 
 
 # ─── HELP RENDERING ─────────────────────────────────────────────────────────
+
 
 def help_usage_line(color: bool) -> str:
     tokens = (
@@ -845,7 +1233,10 @@ def help_usage_line(color: bool) -> str:
 
 
 def help_wrapped_lines(
-    text: str, color: bool, *codes: str, indent: int = 0,
+    text: str,
+    color: bool,
+    *codes: str,
+    indent: int = 0,
 ) -> list[str]:
     width = terminal_columns()
     longest_word = max((cell_width(word) for word in text.split()), default=0)
@@ -897,12 +1288,28 @@ def render_help(color: bool | None = None) -> str:
     color = terminal_color_enabled() if color is None else color
     width = terminal_columns()
     rule = "─" * min(width, BANNER_RULE_WIDTH_MAXIMUM)
-    lines: list[str] = []
-    lines.append(style(f"{PRODUCT_TITLE} ({PROGRAM_NAME})", ANSI_CYAN, ANSI_BOLD, enabled=color))
-    lines.append(style("Fast project context for terminals and AI agents.", ANSI_WHITE, enabled=color))
+    lines = help_wrapped_lines(
+        f"{PRODUCT_TITLE} ({PROGRAM_NAME})",
+        color,
+        ANSI_CYAN,
+        ANSI_BOLD,
+    )
+    lines.extend(
+        help_wrapped_lines(
+            "Fast project context for terminals and AI agents.",
+            color,
+            ANSI_WHITE,
+        )
+    )
+    lines.extend(
+        help_wrapped_lines(
+            f"Equivalent command alias: {ALIAS_COMMAND}",
+            color,
+            ANSI_DIM,
+        )
+    )
     lines.append(style(rule, ANSI_DIM, ANSI_CYAN, enabled=color))
     lines.extend(("", style("Usage", ANSI_CYAN, ANSI_BOLD, enabled=color), help_usage_line(color)))
-    lines.extend(("", style("Commands", ANSI_CYAN, ANSI_BOLD, enabled=color)))
     command_rows = (
         ("prs", "scan the current directory"),
         ("prs <path>", "scan a file or directory"),
@@ -910,12 +1317,7 @@ def render_help(color: bool | None = None) -> str:
         ("prs version", "show version"),
         ("prs status", "show runtime status"),
     )
-    command_width = max(cell_width(command) for command, _ in command_rows) + 2
-    for command, description in command_rows:
-        lines.append(
-            f"  {style(pad_cells(command, command_width), ANSI_BLUE, ANSI_BOLD, enabled=color)} "
-            f"{style(description, ANSI_WHITE, enabled=color)}"
-        )
+    lines.extend(help_table("Commands", command_rows, color))
     lines.extend(("", style("Examples", ANSI_CYAN, ANSI_BOLD, enabled=color)))
     for example in (
         "prs",
@@ -923,37 +1325,105 @@ def render_help(color: bool | None = None) -> str:
         "prs --only .md",
         'prs ~/code/app --only -e .ts .tsx --scan-data "tree, lines, size"',
         "prs ~/code/app --ignore-hidden --ignore-empty --scan-styling full",
+        "prs --only .md -- ~/code/app",
     ):
-        lines.append("  " + style(example, ANSI_GREEN, enabled=color))
+        lines.extend(help_wrapped_lines(example, color, ANSI_GREEN, indent=2))
     lines.append(style(rule, ANSI_DIM, ANSI_CYAN, enabled=color))
-    lines.extend(help_table("Filter modes", (
-        ("--ignore", "Exclude entries matching selectors. Default mode when filters exist."),
-        ("--only", "Include only entries matching selectors. Shorthand accepted, e.g. --only .md."),
-        ("--full", "Include every entry, including hidden and empty entries."),
-    ), color))
-    lines.extend(help_table("Selectors", (
-        ("-f, --paths <paths...>", "Match relative paths and everything inside matched directories."),
-        ("-t, --types <types...>", "Match entry types: file, dir, link."),
-        ("-e, --extensions <ext...>", "Match extensions such as .ts, .json, or .md."),
-        ("-n, --names <names...>", "Match exact file or directory basenames."),
-    ), color))
-    lines.extend(help_table("Visibility", (
-        ("--ignore-hidden", "Hide dot-prefixed files and directories."),
-        ("--ignore-empty", "Hide empty files and directories."),
-    ), color))
-    lines.extend(help_table("Rendering", (
-        ("--scan-styling <full|low|minimal>", "Set layout style: full, low, or minimal. Color follows terminal support."),
-        ("--scan-emojis <true|false>", "Show or hide file-type emojis in entry names."),
-        ("--scan-data <\"item, item, ...\">", "Comma-separated items: tree, lines, size, modified, type, git, summary."),
-    ), color))
-    lines.extend(help_table("Runtime", (
-        ("--scan-timeout <seconds>", "Stop after the given time and print the partial result."),
-        ("--auto-copy <true|false>", "Copy plain scan output to the clipboard after rendering."),
-    ), color))
-    lines.extend(help_table("Configuration", (("--config <path>", "Use a specific config.yaml file."),), color))
+    lines.extend(
+        help_table(
+            "Filter modes",
+            (
+                ("--ignore", "Exclude entries matching selectors. Default mode when filters exist."),
+                ("--only", "Include only entries matching selectors. Shorthand accepted, e.g. --only .md."),
+                ("--full", "Include every entry, including hidden and empty entries."),
+            ),
+            color,
+        )
+    )
+    lines.extend(
+        help_table(
+            "Selectors",
+            (
+                ("-f, --paths <paths...>", "Match relative paths and everything inside matched directories."),
+                ("-t, --types <types...>", "Match entry types: file, dir, link."),
+                ("-e, --extensions <ext...>", "Match extensions such as .ts, .json, or .md."),
+                ("-n, --names <names...>", "Match exact file or directory basenames."),
+            ),
+            color,
+        )
+    )
+    lines.extend(
+        help_table(
+            "Visibility",
+            (
+                ("--ignore-hidden", "Hide dot-prefixed files and directories."),
+                ("--include-hidden", "Show dot-prefixed files and directories, overriding config."),
+                ("--ignore-empty", "Hide empty files and directories."),
+                ("--include-empty", "Show empty files and directories, overriding config."),
+            ),
+            color,
+        )
+    )
+    lines.extend(
+        help_table(
+            "Rendering",
+            (
+                (
+                    "--scan-styling <full|low|minimal>",
+                    "Set layout style: full, low, or minimal. Color follows terminal support.",
+                ),
+                ("--scan-emojis <true|false>", "Show or hide file-type emojis in entry names."),
+                (
+                    '--scan-data <"item, item, ...">',
+                    "Comma-separated items: tree, lines, size, modified, type, git, summary.",
+                ),
+            ),
+            color,
+        )
+    )
+    lines.extend(
+        help_table(
+            "Runtime",
+            (
+                ("--scan-timeout <seconds>", "Use a best-effort scan budget and print a partial result when exceeded."),
+                ("--auto-copy <true|false>", "Copy plain scan output to the clipboard after rendering."),
+                ("-h, --help", "Show this help when used before '--'."),
+                ("--version", "Show the runtime version when used before '--'."),
+            ),
+            color,
+        )
+    )
+    lines.extend(
+        help_table(
+            "Configuration",
+            (
+                ("--config <path>", "Use a specific config.yaml file."),
+                ("--project-config <auto|ignore|require>", "Control repository-owned .prs.yaml or prs.yaml discovery."),
+            ),
+            color,
+        )
+    )
     lines.append("")
-    lines.extend(help_wrapped_lines("Command-like path names can be scanned with ./help, ./status, or ./version.", color, ANSI_DIM))
-    lines.extend(help_wrapped_lines("Selector values beginning with '-' use attached syntax, for example --names=-draft.", color, ANSI_DIM))
+    lines.extend(
+        help_wrapped_lines(
+            "Command-like path names can be scanned with ./help, ./status, or ./version.", color, ANSI_DIM
+        )
+    )
+    lines.extend(
+        help_wrapped_lines(
+            "Place the scan path before selectors, or after '--' when selectors come first.", color, ANSI_DIM
+        )
+    )
+    lines.extend(
+        help_wrapped_lines(
+            "Selector values beginning with '-' use attached syntax, for example --names=-draft.", color, ANSI_DIM
+        )
+    )
+    lines.extend(
+        help_wrapped_lines(
+            "--full rejects selectors and hide flags instead of silently discarding them.", color, ANSI_DIM
+        )
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -966,30 +1436,14 @@ def render_usage_error(message: str, color: bool | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
-# ─── CLI PARSING ────────────────────────────────────────────────────────────
+def render_runtime_error(message: str, color: bool | None = None) -> str:
+    color = terminal_color_enabled() if color is None else color
+    message = sanitize_terminal_text(message)
+    lines = help_wrapped_lines(f"{PROGRAM_NAME}: {message}", color, ANSI_RED, ANSI_BOLD)
+    return "\n".join(lines) + "\n"
 
-# Argv-preprocessing tables. These duplicate flag names from build_parser
-# because argv must be reordered/expanded BEFORE the parser is constructed
-# (the parser would otherwise misinterpret a path token as a selector
-# value). Keep in sync with build_parser when adding flags.
-MODE_FLAGS = {"--ignore", "--only"}
-SELECTOR_FLAGS = {
-    "-f": "--paths", "--paths": "--paths",
-    "-t": "--types", "--types": "--types",
-    "-e": "--extensions", "--extensions": "--extensions",
-    "-n": "--names", "--names": "--names",
-}
-# Selector long forms in canonical output order (used by expand_selector_shortcuts
-# to emit grouped shortcuts in a stable order).
-SELECTOR_ORDER = ("--paths", "--types", "--extensions", "--names")
-VALUE_FLAGS = {
-    "--scan-styling", "--scan-emojis", "--scan-data", "--scan-timeout",
-    "--auto-copy", "--config",
-}
-FLAG_OPTIONS = {
-    *MODE_FLAGS, "--full", "--ignore-hidden", "--ignore-empty",
-    "--help", "-h", "--version",
-}
+
+# ─── CLI PARSING ────────────────────────────────────────────────────────────
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1001,26 +1455,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("path", nargs="?", default=".", help="directory or file to scan")
 
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument("--ignore", action="store_true", help="exclude entries matching filters")
-    mode_group.add_argument("--only", action="store_true", help="include only entries matching filters")
-    mode_group.add_argument("--full", action="store_true", help="include all entries, including hidden and empty entries")
-
-    parser.add_argument("-f", "--paths", nargs="+", action="append", help="match relative paths and matched directory contents")
-    parser.add_argument("-t", "--types", nargs="+", action="append", help="match entry types: file, dir, link")
-    parser.add_argument("-e", "--extensions", nargs="+", action="append", help="match file extensions, such as .ts or .md")
-    parser.add_argument("-n", "--names", nargs="+", action="append", help="match exact file or directory basenames")
-
-    parser.add_argument("--ignore-hidden", action="store_true", default=None, help="ignore dot-prefixed files and directories")
-    parser.add_argument("--ignore-empty", action="store_true", default=None, help="ignore empty files and directories")
-    parser.add_argument("--scan-styling", choices=STYLING_LEVELS, help="set output scan-styling")
-    parser.add_argument("--scan-emojis", choices=("true", "false"), help="show or hide emojis")
-    parser.add_argument("--scan-data", help="comma-separated items: tree, lines, size, modified, type, git, summary")
-    parser.add_argument("--scan-timeout", type=float, help="stop scanning after seconds and print partial result")
-    parser.add_argument("--auto-copy", choices=("true", "false"), help="copy scan output to clipboard")
-    parser.add_argument("--config", help="use a specific config.yaml file")
-    parser.add_argument("--help", "-h", action="store_true", help="show help")
-    parser.add_argument("--version", action="store_true", help="show version")
+    groups: dict[str, argparse._ActionsContainer] = {
+        "general": parser,
+        "selector": parser,
+        "mode": parser.add_mutually_exclusive_group(),
+        "hidden": parser.add_mutually_exclusive_group(),
+        "empty": parser.add_mutually_exclusive_group(),
+    }
+    for spec in CLI_OPTION_SPECS:
+        target = groups[spec.group]
+        # argparse exposes a heterogeneous keyword surface; Any is confined
+        # to this adapter after values are validated by CLIOptionSpec.
+        kwargs: dict[str, Any] = {"dest": spec.dest, "help": spec.help}
+        if spec.value_mode == "multiple":
+            kwargs.update(nargs="+", action=spec.action or "append")
+        elif spec.value_mode == "single":
+            if spec.choices:
+                kwargs["choices"] = spec.choices
+            if spec.converter is not None:
+                kwargs["type"] = spec.converter
+        else:
+            kwargs["action"] = spec.action or "store_true"
+            if spec.action == "store_const":
+                kwargs["const"] = spec.const
+                kwargs["default"] = spec.default
+        target.add_argument(*spec.flags, **kwargs)
     return parser
 
 
@@ -1032,135 +1491,118 @@ def selector_flag_for_shortcut(value: str) -> str:
         return "--types"
     if normalized == ".":
         return "--paths"
-    if normalized.startswith(".") and "/" not in normalized and "\\" not in normalized:
+    if normalized.startswith(".") and "/" not in normalized:
         return "--extensions"
-    if "/" in normalized or "\\" in normalized:
+    if "/" in normalized:
         return "--paths"
     return "--names"
 
 
-def scan_path_exists(value: str) -> bool:
-    """Return True if the expanded path exists (without following symlinks).
+def split_attached_option(token: str) -> tuple[str, str | None]:
+    """Split an attached option value without interpreting arbitrary tokens."""
+    if "=" not in token or not token.startswith("-"):
+        return token, None
+    flag, value = token.split("=", 1)
+    return flag, value
 
-    Propagates ConfigError from expand_user_path (e.g., unresolvable HOME)
-    so the user sees the underlying configuration problem instead of having
-    the path silently treated as non-existent.
+
+def grouped_shortcut_tokens(values: Sequence[str]) -> list[str]:
+    """Convert mode shorthand values into canonical selector arguments."""
+    grouped: dict[str, list[str]] = {}
+    for value in values:
+        grouped.setdefault(selector_flag_for_shortcut(value), []).append(value)
+    output: list[str] = []
+    for flag in SELECTOR_ORDER:
+        if flag in grouped:
+            output.extend((flag, *grouped[flag]))
+    return output
+
+
+def canonicalize_cli_argv(argv: Sequence[str]) -> list[str]:
+    """Return deterministic argv for argparse without filesystem heuristics.
+
+    The scan path is the sole bare positional token outside option values. A
+    path following selectors must be placed after ``--``. Selector options
+    consume one or more values until the next option; values beginning with a
+    dash use attached syntax such as ``--names=-draft``.
     """
-    return os.path.lexists(expand_user_path(value, "scan path"))
-
-
-def is_unambiguous_scan_path(value: str) -> bool:
-    """Heuristic: a token is unambiguously a scan path if it is absolute,
-    contains a path separator, or names an existing directory.
-
-    Existing files (and symlinks-to-files) are intentionally NOT treated as
-    unambiguous paths: a bare basename like ``package.json`` is more likely
-    a ``--names`` selector value than a scan path. Directories are
-    unambiguous because ``prs <dir>`` is the canonical scan form and
-    directories are rarely valid selector values.
-    """
-    expanded = expand_user_path(value, "scan path")
-    return expanded.is_absolute() or "/" in value or "\\" in value or expanded.is_dir()
-
-
-def extract_scan_path_argument(argv: Sequence[str]) -> list[str]:
-    """Move an unambiguous scan path ahead of variable-length selectors."""
+    option_tokens: list[str] = []
+    scan_path: str | None = None
     tokens = list(argv)
-    path_indexes: list[int] = []
-    inferred_path_indexes: list[int] = []
-    ambiguous: list[tuple[str, str]] = []
     index = 0
+
     while index < len(tokens):
         token = tokens[index]
         if token == "--":
             trailing = tokens[index + 1 :]
             if len(trailing) != 1:
                 raise ConfigError("'--' must be followed by exactly one scan path")
-            if path_indexes:
-                values = ", ".join(
-                    [sanitize_terminal_text(tokens[item]) for item in path_indexes]
-                    + [sanitize_terminal_text(trailing[0])]
+            if scan_path is not None:
+                raise ConfigError(
+                    "multiple scan paths were provided: "
+                    f"{sanitize_terminal_text(scan_path)}, {sanitize_terminal_text(trailing[0])}"
                 )
-                raise ConfigError(f"multiple scan paths were provided: {values}")
-            return tokens
-        if token in VALUE_FLAGS:
-            index += 2
+            scan_path = trailing[0]
+            break
+
+        flag, attached_value = split_attached_option(token)
+        spec = OPTION_SPEC_BY_FLAG.get(flag)
+        if spec is None:
+            if token.startswith("-"):
+                option_tokens.append(token)
+            else:
+                if scan_path is not None:
+                    raise ConfigError(
+                        "multiple scan paths were provided: "
+                        f"{sanitize_terminal_text(scan_path)}, {sanitize_terminal_text(token)}"
+                    )
+                scan_path = token
+            index += 1
             continue
-        if token in FLAG_OPTIONS:
-            if token in MODE_FLAGS:
-                run_start = index + 1
-                run_end = run_start
-                while run_end < len(tokens) and not tokens[run_end].startswith("-"):
-                    run_end += 1
-                run = tokens[run_start:run_end]
-                if len(run) > 1 and (scan_path_exists(run[-1]) or is_unambiguous_scan_path(run[-1])):
-                    if is_unambiguous_scan_path(run[-1]):
-                        inferred_path_indexes.append(run_end - 1)
-                    else:
-                        ambiguous.append((token, run[-1]))
-                index = run_end
+
+        if spec.value_mode == "flag":
+            if attached_value is not None:
+                raise ConfigError(f"{flag} does not accept a value")
+            option_tokens.append(flag)
+            index += 1
+            if flag in SHORTCUT_MODE_FLAGS:
+                values: list[str] = []
+                while index < len(tokens) and not tokens[index].startswith("-"):
+                    values.append(tokens[index])
+                    index += 1
+                option_tokens.extend(grouped_shortcut_tokens(values))
+            continue
+
+        if spec.value_mode == "single":
+            if attached_value is not None:
+                option_tokens.append(f"{flag}={attached_value}")
+                index += 1
                 continue
             index += 1
-            continue
-        canonical_selector = SELECTOR_FLAGS.get(token)
-        if canonical_selector is not None:
-            run_start = index + 1
-            run_end = run_start
-            while run_end < len(tokens) and not tokens[run_end].startswith("-"):
-                run_end += 1
-            run = tokens[run_start:run_end]
-            if len(run) > 1 and (scan_path_exists(run[-1]) or is_unambiguous_scan_path(run[-1])):
-                if canonical_selector in {"--paths", "--names"}:
-                    ambiguous.append((token, run[-1]))
-                else:
-                    inferred_path_indexes.append(run_end - 1)
-            index = run_end
-            continue
-        if token.startswith("-"):
+            if index >= len(tokens):
+                raise ConfigError(f"{flag} requires a value")
+            next_flag, _ = split_attached_option(tokens[index])
+            if tokens[index] == "--" or next_flag in OPTION_SPEC_BY_FLAG:
+                raise ConfigError(f"{flag} requires a value")
+            option_tokens.extend((flag, tokens[index]))
             index += 1
             continue
-        path_indexes.append(index)
-        index += 1
 
-    unique_indexes = list(dict.fromkeys(path_indexes or inferred_path_indexes))
-    if len(unique_indexes) > 1:
-        values = ", ".join(sanitize_terminal_text(tokens[item]) for item in unique_indexes)
-        raise ConfigError(f"multiple scan paths were provided: {values}")
-    if not unique_indexes and ambiguous:
-        flag, value = ambiguous[0]
-        raise ConfigError(
-            f"ambiguous scan path '{sanitize_terminal_text(value)}' after {flag}; "
-            "place the scan path before the selector or after '--'"
-        )
-    if unique_indexes:
-        path_index = unique_indexes[0]
-        path = tokens.pop(path_index)
-        tokens.insert(0, path)
-    return tokens
-
-
-def expand_selector_shortcuts(argv: Sequence[str]) -> list[str]:
-    if not any(token in MODE_FLAGS for token in argv):
-        return list(argv)
-    output: list[str] = []
-    index = 0
-    while index < len(argv):
-        token = argv[index]
-        if token in MODE_FLAGS:
-            output.append(token)
+        if attached_value is not None:
+            option_tokens.append(f"{flag}={attached_value}")
             index += 1
-            grouped: dict[str, list[str]] = {}
-            while index < len(argv) and not argv[index].startswith("-"):
-                shortcut = argv[index]
-                grouped.setdefault(selector_flag_for_shortcut(shortcut), []).append(shortcut)
-                index += 1
-            for flag in SELECTOR_ORDER:
-                if flag in grouped:
-                    output.extend([flag, *grouped[flag]])
             continue
-        output.append(token)
+        selector_values: list[str] = []
         index += 1
-    return output
+        while index < len(tokens) and not tokens[index].startswith("-"):
+            selector_values.append(tokens[index])
+            index += 1
+        if not selector_values:
+            raise ConfigError(f"{flag} requires at least one value")
+        option_tokens.extend((flag, *selector_values))
+
+    return [scan_path or ".", *option_tokens]
+
 
 def cli_rules(args: argparse.Namespace) -> FilterRules:
     def flatten(groups: list[list[str]] | None) -> list[str]:
@@ -1177,8 +1619,8 @@ def cli_rules(args: argparse.Namespace) -> FilterRules:
 
 def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
     parser = build_parser()
-    expanded_argv = expand_selector_shortcuts(extract_scan_path_argument(argv))
-    args = parser.parse_args(expanded_argv)
+    canonical_argv = canonicalize_cli_argv(argv)
+    args = parser.parse_args(canonical_argv)
     # args.help / args.version are unreachable here: run() dispatches the
     # help/version tokens before resolve_runtime_config is called, and the
     # parser's own --help/--version actions are store_true (no exit). If
@@ -1188,11 +1630,26 @@ def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
     if not os.path.lexists(root_path):
         raise ConfigError(f"scan path does not exist: {root_path}")
 
-    config_path = find_config_path(args.config, root_path)
-    file_payload = load_yaml_payload(config_path) if config_path is not None else {}
-    config_payload = config_from_payload(file_payload)
+    project_config_mode = args.project_config or "auto"
+    project_path = selected_project_config_path(root_path, project_config_mode)
+    config_paths = config_paths_with_project(args.config, project_path)
+    explicit_identity = (
+        os.path.realpath(expand_user_path(args.config, "config path")) if args.config is not None else None
+    )
+    restrict_project_auto_copy = (
+        project_path
+        if project_path is not None
+        and (explicit_identity is None or os.path.realpath(project_path) != explicit_identity)
+        else None
+    )
+    config_payload = merged_config_payload(config_paths, restrict_project_auto_copy)
     config_rules = normalize_rules(config_payload)
     explicit_rules = cli_rules(args)
+
+    if args.full and explicit_rules.has_rules:
+        raise ConfigError("--full cannot be combined with filter selectors")
+    if args.full and (args.ignore_hidden is True or args.ignore_empty is True):
+        raise ConfigError("--full cannot be combined with --ignore-hidden or --ignore-empty")
 
     rules = FilterRules(
         paths=explicit_rules.paths if args.paths is not None else config_rules.paths,
@@ -1222,10 +1679,10 @@ def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
     scan_timeout = normalize_float(config_payload["scan_timeout"], "scan_timeout")
     auto_copy = normalize_bool(config_payload["auto_copy"], "auto_copy")
 
-    if args.ignore_hidden:
-        ignore_hidden = True
-    if args.ignore_empty:
-        ignore_empty = True
+    if args.ignore_hidden is not None:
+        ignore_hidden = args.ignore_hidden
+    if args.ignore_empty is not None:
+        ignore_empty = args.ignore_empty
     if args.scan_styling is not None:
         scan_styling = args.scan_styling
     if args.scan_emojis is not None:
@@ -1243,7 +1700,7 @@ def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
 
     return RuntimeConfig(
         root_path=root_path,
-        config_path=config_path,
+        config_paths=config_paths,
         filter_mode=filter_mode,
         rules=rules,
         ignore_hidden=ignore_hidden,
@@ -1257,6 +1714,7 @@ def resolve_runtime_config(argv: Sequence[str]) -> RuntimeConfig:
 
 
 # ─── FILTERING ──────────────────────────────────────────────────────────────
+
 
 def is_hidden_rel_path(rel_path: str) -> bool:
     if rel_path in {"", "."}:
@@ -1285,7 +1743,7 @@ def rules_match(node: EntryNode, rules: FilterRules) -> bool:
 
 
 def should_keep_node(node: EntryNode, config: RuntimeConfig, is_root: bool) -> bool:
-    if is_root and node.kind == "dir":
+    if is_root:
         return True
     if config.ignore_hidden and is_hidden_rel_path(node.rel_path):
         return False
@@ -1299,12 +1757,13 @@ def should_keep_node(node: EntryNode, config: RuntimeConfig, is_root: bool) -> b
     if config.ignore_empty:
         if node.kind == "file" and node.size == 0:
             return False
-        if node.kind == "dir" and not node.children:
+        if node.kind == "dir" and not node.children and not node.incomplete:
             return False
     return True
 
 
 # ─── FILE METADATA ──────────────────────────────────────────────────────────
+
 
 def count_file_lines_fd(file_fd: int, state: ScanState) -> int | None:
     """Count newlines in an open file descriptor.
@@ -1318,7 +1777,11 @@ def count_file_lines_fd(file_fd: int, state: ScanState) -> int | None:
     saw_bytes = False
     last_byte = b""
     while True:
+        if state.timeout_reached():
+            return None
         chunk = os.read(file_fd, TEXT_READ_CHUNK_SIZE)
+        if state.timeout_reached():
+            return None
         if not chunk:
             break
         if b"\0" in chunk:
@@ -1326,22 +1789,9 @@ def count_file_lines_fd(file_fd: int, state: ScanState) -> int | None:
         saw_bytes = True
         total += chunk.count(b"\n")
         last_byte = chunk[-1:]
-        if state.timeout_reached():
-            return None
     if saw_bytes and last_byte != b"\n":
         total += 1
     return total
-
-
-def file_snapshot_identity(path_stat: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return (
-        path_stat.st_dev,
-        path_stat.st_ino,
-        stat.S_IFMT(path_stat.st_mode),
-        path_stat.st_size,
-        path_stat.st_mtime_ns,
-        path_stat.st_ctime_ns,
-    )
 
 
 def stat_kind_from_mode(mode: int) -> str:
@@ -1360,19 +1810,26 @@ def link_target(name: str, parent_fd: int | None = None) -> str:
 
 # ─── SCANNING ───────────────────────────────────────────────────────────────
 
-def prefilter_entry(path: Path, rel_path: str, name: str, kind: str, config: RuntimeConfig) -> bool:
+
+def prefilter_entry(rel_path: str, name: str, kind: str, config: RuntimeConfig) -> bool:
     if config.ignore_hidden and is_hidden_rel_path(rel_path):
         return False
-    probe = EntryNode(path=path, rel_path=rel_path, name=name, kind=kind, size=0, mtime=0)
-    if config.filter_mode == "ignore" and rules_match(probe, config.rules):
-        return False
+    rules = config.rules
+    if config.filter_mode == "ignore":
+        if name in rules.names or any(path_selector_matches(selector, rel_path) for selector in rules.paths):
+            return False
+        if kind in rules.types:
+            return False
+        if kind == "file":
+            ext = Path(name).suffix.lower()
+            if ext and ext in rules.extensions:
+                return False
     if config.filter_mode == "only" and kind == "dir":
-        path_rules = config.rules.paths
+        path_rules = rules.paths
         path_relevant = any(
-            path_selector_matches(selector, rel_path) or selector.startswith(f"{rel_path}/")
-            for selector in path_rules
+            path_selector_matches(selector, rel_path) or selector.startswith(f"{rel_path}/") for selector in path_rules
         )
-        if path_rules and not path_relevant and not config.rules.types and not config.rules.extensions and not config.rules.names:
+        if path_rules and not path_relevant and not rules.types and not rules.extensions and not rules.names:
             return False
     return True
 
@@ -1380,10 +1837,17 @@ def prefilter_entry(path: Path, rel_path: str, name: str, kind: str, config: Run
 def prefilter_before_stat(rel_path: str, name: str, config: RuntimeConfig) -> bool:
     if config.ignore_hidden and is_hidden_rel_path(rel_path):
         return False
-    if config.filter_mode == "ignore":
-        if name in config.rules.names or any(path_selector_matches(selector, rel_path) for selector in config.rules.paths):
-            return False
-    if config.filter_mode == "only" and config.rules.paths and not config.rules.types and not config.rules.extensions and not config.rules.names:
+    if config.filter_mode == "ignore" and (
+        name in config.rules.names or any(path_selector_matches(selector, rel_path) for selector in config.rules.paths)
+    ):
+        return False
+    if (
+        config.filter_mode == "only"
+        and config.rules.paths
+        and not config.rules.types
+        and not config.rules.extensions
+        and not config.rules.names
+    ):
         return any(
             path_selector_matches(selector, rel_path) or selector.startswith(f"{rel_path}/")
             for selector in config.rules.paths
@@ -1404,31 +1868,41 @@ def initialize_aggregate(node: EntryNode) -> None:
         node.newest_entry = (node.summary_path, node.mtime)
         return
     node.total_dirs = 1
-    node.total_files = sum(child.total_files for child in node.children)
-    node.total_dirs += sum(child.total_dirs for child in node.children)
-    node.total_links = sum(child.total_links for child in node.children)
-    node.total_lines = sum(child.total_lines for child in node.children)
-    node.unknown_lines = sum(child.unknown_lines for child in node.children)
-    largest = [child.largest_file for child in node.children if child.largest_file is not None]
-    node.largest_file = max(largest, key=lambda item: item[1], default=None)
-    newest_leaves = [
-        child.newest_entry for child in node.children
-        if child.newest_entry is not None and (child.total_files or child.total_links)
-    ]
-    newest_any = [child.newest_entry for child in node.children if child.newest_entry is not None]
-    node.newest_entry = max(newest_leaves or newest_any, key=lambda item: item[1], default=(node.summary_path, node.mtime))
+    node.total_files = 0
+    node.total_links = 0
+    node.total_lines = 0
+    node.unknown_lines = 0
+    largest: tuple[str, int] | None = None
+    newest_any: tuple[str, float] = (node.summary_path, node.mtime)
+    for child in node.children:
+        node.total_files += child.total_files
+        node.total_dirs += child.total_dirs
+        node.total_links += child.total_links
+        node.total_lines += child.total_lines
+        node.unknown_lines += child.unknown_lines
+        if child.largest_file is not None and (largest is None or child.largest_file[1] > largest[1]):
+            largest = child.largest_file
+        if child.newest_entry is not None and child.newest_entry[1] > newest_any[1]:
+            newest_any = child.newest_entry
+    node.largest_file = largest
+    node.newest_entry = newest_any
 
 
 def create_leaf(
-    path: Path, rel_path: str, path_stat: os.stat_result, kind: str,
-    state: ScanState, is_root: bool, parent_fd: int | None = None,
+    path: Path,
+    rel_path: str,
+    path_stat: os.stat_result,
+    kind: str,
+    state: ScanState,
+    is_root: bool,
+    parent_fd: int | None = None,
     entry_name: str | None = None,
 ) -> EntryNode | None:
     name = path.name or str(path)
     if kind == "special":
         state.warn(rel_path, "unsupported special filesystem entry skipped")
         return None
-    if not is_root and not prefilter_entry(path, rel_path, name, kind, state.config):
+    if not is_root and not prefilter_entry(rel_path, name, kind, state.config):
         return None
     if kind == "link":
         try:
@@ -1438,7 +1912,8 @@ def create_leaf(
             state.warn(rel_path, f"unable to read link target: {exc}")
         try:
             observed_stat = os.stat(
-                entry_name or os.fspath(path), dir_fd=parent_fd,
+                entry_name or os.fspath(path),
+                dir_fd=parent_fd,
                 follow_symlinks=False,
             )
             if (observed_stat.st_dev, observed_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
@@ -1450,12 +1925,45 @@ def create_leaf(
         node = EntryNode(path, rel_path, name, kind, 0, observed_stat.st_mtime, target=target)
     else:
         access_name = entry_name or os.fspath(path)
+        inspect_content = "lines" in state.config.scan_data or "summary" in state.config.scan_data
+        if not inspect_content:
+            try:
+                observed_stat = os.stat(
+                    access_name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                state.warn(rel_path, f"unable to verify file metadata: {sanitize_terminal_text(exc)}")
+                return None
+            if (observed_stat.st_dev, observed_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                state.warn(rel_path, "directory entry was replaced while the file was being scanned")
+                return None
+            if not stat.S_ISREG(observed_stat.st_mode):
+                state.warn(rel_path, "entry type changed while the file was being scanned")
+                return None
+            if observed_stat.st_size == 0 and state.config.ignore_empty and not is_root:
+                return None
+            node = EntryNode(
+                path,
+                rel_path,
+                name,
+                kind,
+                observed_stat.st_size,
+                observed_stat.st_mtime,
+                lines=None,
+            )
+            initialize_aggregate(node)
+            return node if should_keep_node(node, state.config, is_root) else None
+
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         stable_result: tuple[os.stat_result, int | None] | None = None
         instability = "file changed while its content was being inspected"
+        last_error: OSError | None = None
         attempts = 0
         while attempts < FILE_READ_MAX_ATTEMPTS and not state.timeout_reached():
             attempts += 1
+            last_error = None
             file_fd: int | None = None
             try:
                 file_fd = os.open(access_name, flags, dir_fd=parent_fd)
@@ -1469,25 +1977,34 @@ def create_leaf(
                 try:
                     lines = count_file_lines_fd(file_fd, state)
                 except OSError as exc:
-                    state.warn(rel_path, f"unable to count lines: {exc}")
-                    return None
-                observed_stat = os.fstat(file_fd)
+                    lines = None
+                    state.warn(rel_path, f"unable to count lines: {sanitize_terminal_text(exc)}")
                 try:
+                    post_read_stat = os.fstat(file_fd)
                     current_path_stat = os.stat(access_name, dir_fd=parent_fd, follow_symlinks=False)
                 except OSError as exc:
-                    instability = f"unable to verify the directory entry after reading: {exc}"
+                    instability = f"unable to verify file metadata after reading: {exc}"
                     continue
-                if (current_path_stat.st_dev, current_path_stat.st_ino) != (
-                    observed_stat.st_dev, observed_stat.st_ino
-                ):
+                if (current_path_stat.st_dev, current_path_stat.st_ino) != (opened_stat.st_dev, opened_stat.st_ino):
                     instability = "directory entry was replaced while the file was being read"
                     continue
-                if file_snapshot_identity(opened_stat) != file_snapshot_identity(observed_stat):
-                    instability = "file metadata changed while its content was being read"
+                before_signature = (
+                    opened_stat.st_size,
+                    opened_stat.st_mtime_ns,
+                    opened_stat.st_ctime_ns,
+                )
+                after_signature = (
+                    post_read_stat.st_size,
+                    post_read_stat.st_mtime_ns,
+                    post_read_stat.st_ctime_ns,
+                )
+                if after_signature != before_signature:
+                    instability = "file content changed while it was being read"
                     continue
-                stable_result = observed_stat, lines
+                stable_result = post_read_stat, lines
                 break
             except OSError as exc:
+                last_error = exc
                 instability = f"unable to inspect file safely: {exc}"
             finally:
                 if file_fd is not None:
@@ -1495,14 +2012,38 @@ def create_leaf(
         if stable_result is None:
             if attempts == 0 and state.timed_out:
                 return None
+            if last_error is not None and last_error.errno in {
+                errno.EACCES,
+                errno.EPERM,
+                errno.EMFILE,
+                errno.ENFILE,
+            }:
+                state.warn(rel_path, f"unable to read file content: {sanitize_terminal_text(last_error)}")
+                node = EntryNode(
+                    path,
+                    rel_path,
+                    name,
+                    kind,
+                    path_stat.st_size,
+                    path_stat.st_mtime,
+                    lines=None,
+                    incomplete=True,
+                )
+                initialize_aggregate(node)
+                return node if should_keep_node(node, state.config, is_root) else None
             state.warn(rel_path, f"{instability}; skipped after {attempts} attempt(s)")
             return None
         observed_stat, lines = stable_result
-        if observed_stat.st_size == 0 and state.config.ignore_empty:
+        if observed_stat.st_size == 0 and state.config.ignore_empty and not is_root:
             return None
         node = EntryNode(
-            path, rel_path, name, kind, observed_stat.st_size,
-            observed_stat.st_mtime, lines=lines,
+            path,
+            rel_path,
+            name,
+            kind,
+            observed_stat.st_size,
+            observed_stat.st_mtime,
+            lines=lines,
         )
     initialize_aggregate(node)
     return node if should_keep_node(node, state.config, is_root) else None
@@ -1517,12 +2058,19 @@ class DirectoryFrame:
     iterator: Iterator[os.DirEntry[str]]
     fd: int
     children: list[EntryNode] = field(default_factory=list)
+    incomplete: bool = False
 
 
 def directory_frame(
-    path: Path, rel_path: str, path_stat: os.stat_result, state: ScanState,
-    is_root: bool, fd: int,
+    path: Path,
+    rel_path: str,
+    path_stat: os.stat_result,
+    state: ScanState,
+    is_root: bool,
+    fd: int,
 ) -> DirectoryFrame:
+    incomplete = False
+    iterator: Iterator[os.DirEntry[str]]
     try:
         iterator = os.scandir(fd)
     except OSError as exc:
@@ -1531,18 +2079,44 @@ def directory_frame(
         else:
             state.warn(rel_path, f"unable to read directory: {exc}")
         iterator = iter(())
-    return DirectoryFrame(path, rel_path, path_stat, is_root, iterator, fd)
+        incomplete = True
+    return DirectoryFrame(path, rel_path, path_stat, is_root, iterator, fd, incomplete=incomplete)
+
+
+def incomplete_directory_node(
+    path: Path,
+    rel_path: str,
+    path_stat: os.stat_result,
+    config: RuntimeConfig,
+    is_root: bool,
+) -> EntryNode | None:
+    node = EntryNode(
+        path,
+        rel_path,
+        path.name or str(path),
+        "dir",
+        0,
+        path_stat.st_mtime,
+        incomplete=True,
+    )
+    initialize_aggregate(node)
+    return node if should_keep_node(node, config, is_root) else None
 
 
 def close_directory_frame(frame: DirectoryFrame) -> None:
     close = getattr(frame.iterator, "close", None)
-    if close is not None:
-        close()
-    os.close(frame.fd)
+    try:
+        if close is not None:
+            close()
+    finally:
+        os.close(frame.fd)
 
 
 def scan_path(
-    path: Path, rel_path: str, state: ScanState, is_root: bool = False,
+    path: Path,
+    rel_path: str,
+    state: ScanState,
+    is_root: bool = False,
     physical_path: Path | None = None,
 ) -> EntryNode | None:
     access_path = physical_path or path
@@ -1573,7 +2147,9 @@ def scan_path(
     if root_kind != "dir":
         return create_leaf(access_path, rel_path, root_stat, root_kind, state, is_root)
 
-    directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = (
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
     root_fd: int | None = None
     try:
         root_fd = os.open(access_path, directory_flags)
@@ -1582,11 +2158,13 @@ def scan_path(
         if root_fd is not None:
             os.close(root_fd)
         state.warn(rel_path, f"unable to open directory: {exc}")
-        return None
+        return incomplete_directory_node(path, rel_path, root_stat, state.config, is_root)
     if (opened_root_stat.st_dev, opened_root_stat.st_ino) != (root_stat.st_dev, root_stat.st_ino):
         os.close(root_fd)
         state.warn(rel_path, "scan root changed while it was being opened")
         return None
+    root_identity = (opened_root_stat.st_dev, opened_root_stat.st_ino)
+    state.visited_directories.add(root_identity)
     stack = [directory_frame(path, rel_path, opened_root_stat, state, is_root, root_fd)]
     completed: EntryNode | None = None
     while stack:
@@ -1601,15 +2179,33 @@ def scan_path(
                 entry = next(frame.iterator)
             except StopIteration:
                 entry = None
+                if state.timeout_reached():
+                    frame.incomplete = True
             except OSError as exc:
                 state.warn(frame.rel_path, f"unable to continue reading directory: {exc}")
+                frame.incomplete = True
                 entry = None
+            else:
+                if state.timeout_reached():
+                    frame.incomplete = True
+                    entry = None
+        else:
+            frame.incomplete = True
         if entry is None:
             close_directory_frame(frame)
             frame.children.sort(key=sort_key)
             size = sum(child.size for child in frame.children)
             mtime = max((child.mtime for child in frame.children), default=frame.path_stat.st_mtime)
-            node = EntryNode(frame.path, frame.rel_path, frame.path.name or str(frame.path), "dir", size, mtime, children=frame.children)
+            node = EntryNode(
+                frame.path,
+                frame.rel_path,
+                frame.path.name or str(frame.path),
+                "dir",
+                size,
+                mtime,
+                children=frame.children,
+                incomplete=frame.incomplete,
+            )
             initialize_aggregate(node)
             kept = node if should_keep_node(node, state.config, frame.is_root) else None
             stack.pop()
@@ -1628,7 +2224,7 @@ def scan_path(
             state.warn(child_rel, f"unable to stat entry: {exc}")
             continue
         child_kind = stat_kind_from_mode(child_stat.st_mode)
-        if not prefilter_entry(child_path, child_rel, entry.name, child_kind, state.config):
+        if not prefilter_entry(child_rel, entry.name, child_kind, state.config):
             continue
         if child_kind == "dir":
             child_fd: int | None = None
@@ -1644,14 +2240,44 @@ def scan_path(
                 if child_fd is not None:
                     os.close(child_fd)
                 state.warn(child_rel, f"unable to open directory safely: {exc}")
+                placeholder = incomplete_directory_node(
+                    child_path,
+                    child_rel,
+                    child_stat,
+                    state.config,
+                    False,
+                )
+                if placeholder is not None:
+                    frame.children.append(placeholder)
                 continue
             if child_fd is None:
                 continue
+            child_identity = (opened_child_stat.st_dev, opened_child_stat.st_ino)
+            if child_identity in state.visited_directories:
+                os.close(child_fd)
+                state.warn(child_rel, "directory identity was already scanned; subtree not followed")
+                placeholder = incomplete_directory_node(
+                    child_path,
+                    child_rel,
+                    opened_child_stat,
+                    state.config,
+                    False,
+                )
+                if placeholder is not None:
+                    frame.children.append(placeholder)
+                continue
+            state.visited_directories.add(child_identity)
             stack.append(directory_frame(child_path, child_rel, opened_child_stat, state, False, child_fd))
         else:
             child = create_leaf(
-                child_path, child_rel, child_stat, child_kind, state, False,
-                parent_fd=frame.fd, entry_name=entry.name,
+                child_path,
+                child_rel,
+                child_stat,
+                child_kind,
+                state,
+                False,
+                parent_fd=frame.fd,
+                entry_name=entry.name,
             )
             if child is not None:
                 frame.children.append(child)
@@ -1669,7 +2295,8 @@ def scan(config: RuntimeConfig) -> ScanResult:
     started_at = time.monotonic()
     physical_root = physical_git_path(config.root_path)
     state = ScanState(
-        config=config, started_at=started_at,
+        config=config,
+        started_at=started_at,
         deadline=started_at + config.scan_timeout,
         physical_root=physical_root,
     )
@@ -1682,18 +2309,26 @@ def scan(config: RuntimeConfig) -> ScanResult:
         git_markers, deleted_git_entries, git_warning = load_git_markers(state.physical_root, state)
         if git_warning is not None:
             state.warn(".", git_warning)
+    state.timeout_reached()
     elapsed_ms = int((time.monotonic() - started_at) * 1000)
     return ScanResult(
-        root=root, elapsed_ms=elapsed_ms, timed_out=state.timed_out,
-        warnings=state.warnings, git_markers=git_markers,
+        root=root,
+        elapsed_ms=elapsed_ms,
+        timed_out=state.timed_out,
+        warnings=state.warnings,
+        git_markers=git_markers,
         deleted_git_entries=deleted_git_entries,
     )
 
 
 # ─── GIT STATUS ─────────────────────────────────────────────────────────────
 
+
 def run_git(
-    args: Sequence[str], cwd: Path, state: ScanState, input_data: bytes | None = None,
+    args: Sequence[str],
+    cwd: Path,
+    state: ScanState,
+    input_data: bytes | None = None,
 ) -> tuple[subprocess.CompletedProcess[bytes] | None, str | None]:
     if state.git_deadline is None:
         state.git_deadline = min(state.deadline, time.monotonic() + GIT_TIMEOUT_CAP_SECONDS)
@@ -1706,20 +2341,19 @@ def run_git(
     scan_remaining = state.remaining()
     safety_limited = remaining < scan_remaining
     timeout = remaining
-    environment = os.environ.copy()
-    for key in GIT_ENVIRONMENT_KEYS:
-        environment.pop(key, None)
-    for key in tuple(environment):
-        if key == "GIT_CONFIG_COUNT" or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
-            environment.pop(key, None)
-    environment.update({
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_CONFIG_SYSTEM": os.devnull,
-        "GIT_CONFIG_GLOBAL": os.devnull,
-        "GIT_PAGER": "cat",
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_OPTIONAL_LOCKS": "0",
-    })
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_PAGER": "cat",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "LC_ALL": "C",
+            "LANG": "C",
+        }
+    )
     command = ["git"]
     for override in GIT_CONFIG_OVERRIDES:
         command.extend(("-c", override))
@@ -1729,8 +2363,7 @@ def run_git(
             command,
             cwd=str(cwd),
             env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             input=input_data,
             check=False,
             timeout=timeout,
@@ -1768,15 +2401,21 @@ def marker_from_status(status: str) -> str:
     no index counterpart; deletion is most actionable; renames and adds
     are structural; modified is the catch-all for any remaining change.
     """
-    if "?" in status:
+    if status == "!!":
+        return "[!]"
+    if status in {"DD", "AU", "UD", "UA", "DU", "AA", "UU"}:
+        return "[U]"
+    if status == "??":
         return "[?]"
     if "D" in status:
         return "[D]"
     if "R" in status:
         return "[R]"
+    if "C" in status:
+        return "[C]"
     if "A" in status:
         return "[A]"
-    if status.strip():
+    if any(marker in status for marker in ("M", "T")):
         return "[M]"
     return ""
 
@@ -1794,7 +2433,10 @@ def parse_porcelain_z(payload: bytes) -> dict[str, str]:
         path = os.fsdecode(record[3:])
         marker = marker_from_status(status)
         if path and marker:
-            markers[git_path_identity(path)] = marker
+            # Porcelain appends '/' to ignored directory records. Scanner
+            # relative paths never do, so normalize that presentation suffix.
+            normalized_path = git_path_identity(path).removesuffix("/")
+            markers[normalized_path] = marker
         if "R" in status or "C" in status:
             index += 1
     return markers
@@ -1807,7 +2449,13 @@ def parse_index_deleted(payload: bytes) -> list[tuple[str, str, str]]:
         fields = metadata.split()
         if not separator or len(fields) < 3:
             continue
-        deleted.append((git_path_identity(os.fsdecode(raw_path)), fields[0].decode("ascii", "replace"), fields[1].decode("ascii", "replace")))
+        deleted.append(
+            (
+                git_path_identity(os.fsdecode(raw_path)),
+                fields[0].decode("ascii", "replace"),
+                fields[1].decode("ascii", "replace"),
+            )
+        )
     return deleted
 
 
@@ -1829,11 +2477,17 @@ def parse_tree_entries(payload: bytes) -> dict[str, tuple[str, str]]:
 def executable_git_config_warning(repo_root: Path, state: ScanState) -> str | None:
     result, error = run_git(
         [
-            "config", "--includes", "--null", "--show-scope", "--show-origin",
-            "--name-only", "--get-regexp",
+            "config",
+            "--includes",
+            "--null",
+            "--show-scope",
+            "--show-origin",
+            "--name-only",
+            "--get-regexp",
             r"^(filter\..*\.(clean|smudge|process)|diff\.external|diff\..*\.(command|textconv)|core\.(fsmonitor|hookspath))$",
         ],
-        repo_root, state,
+        repo_root,
+        state,
     )
     if result is None:
         return error or "unable to verify Git configuration safety"
@@ -1847,18 +2501,22 @@ def executable_git_config_warning(repo_root: Path, state: ScanState) -> str | No
         fields.pop()
     if len(fields) % 3:
         return "unable to verify Git configuration safety: git config returned malformed output"
-    keys = sorted({
-        sanitize_terminal_text(os.fsdecode(fields[index + 2]))
-        for index in range(0, len(fields), 3)
-        if os.fsdecode(fields[index]).lower() in {"local", "worktree"}
-    })
+    keys = sorted(
+        {
+            sanitize_terminal_text(os.fsdecode(fields[index + 2]))
+            for index in range(0, len(fields), 3)
+            if os.fsdecode(fields[index]).lower() in {"local", "worktree"}
+        }
+    )
     if not keys:
         return None
     return "Git markers disabled because executable repository configuration is active: " + ", ".join(keys)
 
 
 def deleted_git_metadata(
-    repo_root: Path, state: ScanState, deleted_paths: set[str],
+    repo_root: Path,
+    state: ScanState,
+    deleted_paths: set[str],
 ) -> tuple[list[DeletedGitEntry], str | None]:
     indexed, error = run_git(["ls-files", "--deleted", "--stage", "-z"], repo_root, state)
     if indexed is None:
@@ -1870,7 +2528,9 @@ def deleted_git_metadata(
     missing_paths = deleted_paths.difference(by_path)
     if missing_paths:
         tree, tree_error = run_git(
-            ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], repo_root, state,
+            ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
+            repo_root,
+            state,
         )
         if tree is None:
             return [], tree_error or "unable to inspect deleted Git paths"
@@ -1894,7 +2554,10 @@ def deleted_git_metadata(
     object_ids = list(dict.fromkeys(oid for _, _, oid in raw_entries))
     query = ("\n".join(object_ids) + "\n").encode("ascii")
     sizes_result, size_error = run_git(
-        ["cat-file", "--batch-check=%(objectname) %(objectsize)"], repo_root, state, query,
+        ["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+        repo_root,
+        state,
+        query,
     )
     if sizes_result is None:
         return [], size_error or "unable to inspect deleted Git object sizes"
@@ -1924,7 +2587,7 @@ def has_git_metadata(path: Path) -> bool:
     issue.
     """
     current = path if path.is_dir() and not path.is_symlink() else path.parent
-    for candidate in (current, *current.parents):
+    for candidate in itertools.chain([current], current.parents):
         try:
             os.lstat(candidate / ".git")
         except FileNotFoundError:
@@ -1942,7 +2605,8 @@ def physical_git_path(path: Path) -> Path:
 
 
 def load_git_markers(
-    scan_root: Path, state: ScanState,
+    scan_root: Path,
+    state: ScanState,
 ) -> tuple[dict[str, str], list[DeletedGitEntry], str | None]:
     git_scan_root = scan_root
     # Follow a symlinked scan root so git markers reflect the directory's
@@ -1964,8 +2628,16 @@ def load_git_markers(
     if config_warning is not None:
         return {}, [], config_warning
     result, run_error = run_git(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=dirty"],
-        repo_root, state,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=dirty",
+        ],
+        repo_root,
+        state,
     )
     if result is None:
         return {}, [], run_error or "git markers could not be rendered"
@@ -1975,7 +2647,8 @@ def load_git_markers(
     repo_markers = parse_porcelain_z(result.stdout)
     if any(marker == "[D]" for marker in repo_markers.values()):
         deleted_entries, deleted_warning = deleted_git_metadata(
-            repo_root, state,
+            repo_root,
+            state,
             {path for path, marker in repo_markers.items() if marker == "[D]"},
         )
     else:
@@ -2003,17 +2676,19 @@ def load_git_markers(
 
 # ─── TERMINAL AND DISPLAY WIDTH ───────────────────────────────────────────
 
+
 def terminal_columns() -> int:
+    """Return a bounded terminal width without trusting hostile environment data."""
     raw_columns = os.environ.get("COLUMNS", "")
-    if raw_columns.isdigit() and int(raw_columns) > 0:
-        return min(TERMINAL_WIDTH_MAXIMUM, max(TERMINAL_WIDTH_MINIMUM, int(raw_columns)))
-    # shutil.get_terminal_size is guaranteed to return a usable value: it
-    # falls back to (TERMINAL_WIDTH_FALLBACK, TERMINAL_ROWS_FALLBACK) when the
-    # terminal size cannot be queried, so no exception handling is needed here.
-    return min(
-        TERMINAL_WIDTH_MAXIMUM,
-        max(TERMINAL_WIDTH_MINIMUM, shutil.get_terminal_size((TERMINAL_WIDTH_FALLBACK, TERMINAL_ROWS_FALLBACK)).columns),
-    )
+    if re.fullmatch(r"[0-9]{1,6}", raw_columns):
+        columns = int(raw_columns, 10)
+        if columns > 0:
+            return min(TERMINAL_WIDTH_MAXIMUM, max(TERMINAL_WIDTH_MINIMUM, columns))
+    try:
+        columns = os.get_terminal_size(sys.stdout.fileno()).columns
+    except (AttributeError, OSError, ValueError):
+        columns = TERMINAL_WIDTH_FALLBACK
+    return min(TERMINAL_WIDTH_MAXIMUM, max(TERMINAL_WIDTH_MINIMUM, columns))
 
 
 def char_cell_width(char: str) -> int:
@@ -2063,14 +2738,14 @@ def wrap_cells(text: str, width: int) -> list[str]:
     remaining = text
     while cell_width(remaining) > width:
         candidate = truncate_cells(remaining, width)
-        chunk = candidate[:-1] if candidate.endswith("…") else candidate
+        chunk = candidate.removesuffix("…")
         split_at = chunk.rfind(" ")
         if split_at > 0:
             chunk = chunk[:split_at]
         if not chunk:
             chunk = remaining[0]
         lines.append(chunk.rstrip())
-        remaining = remaining[len(chunk):].lstrip()
+        remaining = remaining[len(chunk) :].lstrip()
     lines.append(remaining)
     return lines
 
@@ -2114,7 +2789,10 @@ def style_git_marker(marker: str, enabled: bool) -> str:
         "[A]": ANSI_GREEN,
         "[D]": ANSI_RED,
         "[R]": ANSI_MAGENTA,
+        "[C]": ANSI_CYAN,
+        "[U]": ANSI_RED,
         "[?]": ANSI_BLUE,
+        "[!]": ANSI_DIM,
     }
     return style(marker, palette.get(marker, ANSI_YELLOW), ANSI_BOLD, enabled=enabled)
 
@@ -2146,14 +2824,18 @@ def styled_columns(columns: Sequence[str], enabled: bool) -> str:
 
 def styled_header_columns(headers: Sequence[str], enabled: bool) -> str:
     return "".join(
-        style(pad_cells(header, METADATA_COLUMN_WIDTH), ANSI_CYAN, ANSI_BOLD, enabled=enabled)
-        for header in headers
+        style(pad_cells(header, METADATA_COLUMN_WIDTH), ANSI_CYAN, ANSI_BOLD, enabled=enabled) for header in headers
     ).rstrip()
 
 
 def render_padded_row(
-    label: str, columns: Sequence[str], node: EntryNode | None, width: int,
-    color: bool, header: bool = False, marker: str = "",
+    label: str,
+    columns: Sequence[str],
+    node: EntryNode | None,
+    width: int,
+    color: bool,
+    header: bool = False,
+    marker: str = "",
 ) -> str:
     """Render a single tree row: label, optional git marker, padding, columns.
 
@@ -2192,6 +2874,7 @@ def render_padded_row(
 
 # ─── FORMATTING UTILITIES ───────────────────────────────────────────────────
 
+
 def display_name(node: EntryNode, emojis: bool) -> str:
     prefix = KIND_EMOJIS[node.kind] if emojis else ""
     name = sanitize_terminal_text(node.name)
@@ -2200,6 +2883,23 @@ def display_name(node: EntryNode, emojis: bool) -> str:
     if node.kind == "link" and node.target:
         return f"{prefix}{name} -> {sanitize_terminal_text(node.target)}"
     return f"{prefix}{name}"
+
+
+def display_relative_path(node: EntryNode, emojis: bool) -> str:
+    """Render an unambiguous path for non-tree output.
+
+    A flat listing must not collapse ``src/a.py`` and ``tests/a.py`` into two
+    indistinguishable ``a.py`` rows. Tree output uses basenames because the
+    connectors carry hierarchy; flat output uses the complete relative path.
+    """
+
+    prefix = KIND_EMOJIS[node.kind] if emojis else ""
+    relative = sanitize_terminal_text(node.rel_path)
+    if node.kind == "dir":
+        return f"{prefix}{relative}/"
+    if node.kind == "link" and node.target:
+        return f"{prefix}{relative} -> {sanitize_terminal_text(node.target)}"
+    return f"{prefix}{relative}"
 
 
 def format_size(size: int) -> str:
@@ -2279,6 +2979,7 @@ def visible_node_label(node: EntryNode, prefix: str, connector: str, emojis: boo
 
 # ─── TREE RENDERING ─────────────────────────────────────────────────────────
 
+
 def metadata_columns(node: EntryNode, scan_data: frozenset[str]) -> list[str]:
     columns: list[str] = []
     if "type" in scan_data:
@@ -2310,11 +3011,17 @@ def header_columns(scan_data: frozenset[str]) -> list[str]:
     return headers
 
 
+def inline_metadata_enabled(scan_data: frozenset[str]) -> bool:
+    headers = header_columns(scan_data)
+    if not headers:
+        return False
+    required = NAME_COLUMN_MIN_WIDTH + cell_width(METADATA_SEPARATOR) + METADATA_COLUMN_WIDTH * len(headers)
+    return terminal_columns() >= required
+
+
 def active_header_columns(scan_data: frozenset[str]) -> list[str]:
     headers = header_columns(scan_data)
-    available = terminal_columns() - NAME_COLUMN_MIN_WIDTH - cell_width(METADATA_SEPARATOR)
-    maximum = max(0, available // METADATA_COLUMN_WIDTH)
-    return headers[:maximum]
+    return headers if inline_metadata_enabled(scan_data) else []
 
 
 def name_column_width(scan_data: frozenset[str]) -> int:
@@ -2323,61 +3030,141 @@ def name_column_width(scan_data: frozenset[str]) -> int:
     return max(NAME_COLUMN_MIN_WIDTH, terminal_columns() - metadata_width - separator_width)
 
 
-def render_flat_entries(root: EntryNode, result: ScanResult, config: RuntimeConfig, color: bool = False) -> list[str]:
+def render_label_row(
+    label: str,
+    node: EntryNode,
+    color: bool,
+    marker: str,
+) -> str:
+    return render_padded_row(
+        label,
+        (),
+        node,
+        terminal_columns(),
+        color,
+        marker=marker,
+    ).rstrip()
+
+
+def render_metadata_detail_lines(
+    node: EntryNode,
+    scan_data: frozenset[str],
+    color: bool,
+) -> list[str]:
     lines: list[str] = []
-    headers = active_header_columns(config.scan_data)
-    width = name_column_width(config.scan_data)
+    for header, value in zip(
+        header_columns(scan_data),
+        metadata_columns(node, scan_data),
+        strict=True,
+    ):
+        lines.extend(
+            help_wrapped_lines(
+                f"{header}: {value}",
+                color,
+                ANSI_DIM,
+                indent=2,
+            )
+        )
+    return lines
+
+
+def render_node_rows(
+    label: str,
+    node: EntryNode,
+    config: RuntimeConfig,
+    color: bool,
+    marker: str,
+    *,
+    header: bool = False,
+) -> list[str]:
+    headers = header_columns(config.scan_data)
+    if not headers:
+        return [render_label_row(label, node, color, marker)]
+    if inline_metadata_enabled(config.scan_data):
+        width = name_column_width(config.scan_data)
+        columns = headers if header else metadata_columns(node, config.scan_data)
+        return [
+            render_padded_row(
+                label,
+                columns,
+                node,
+                width,
+                color,
+                header=header,
+                marker=marker,
+            )
+        ]
+    return [
+        render_label_row(label, node, color, marker),
+        *render_metadata_detail_lines(node, config.scan_data, color),
+    ]
+
+
+def _render_root_row(
+    root: EntryNode,
+    config: RuntimeConfig,
+    color: bool,
+    marker: str,
+    lines: list[str],
+) -> None:
     root_label = display_name(root, config.scan_emojis)
-    root_marker = result.git_markers.get(".", "") if "git" in config.scan_data else ""
-    if headers and root.kind == "dir":
-        lines.append(render_padded_row(root_label, headers, root, width, color, header=True, marker=root_marker))
-    elif headers:
-        root_columns = metadata_columns(root, config.scan_data)[:len(headers)]
-        lines.append(render_padded_row(root_label, root_columns, root, width, color, marker=root_marker))
-    else:
-        label = f"{root_label} {root_marker}" if root_marker else root_label
-        lines.append(style(truncate_cells(label, width), *row_style_for_node(root, color), enabled=color))
+    lines.extend(
+        render_node_rows(
+            root_label,
+            root,
+            config,
+            color,
+            marker,
+            header=root.kind == "dir" and inline_metadata_enabled(config.scan_data),
+        )
+    )
+
+
+def render_flat_entries(
+    root: EntryNode,
+    result: ScanResult,
+    config: RuntimeConfig,
+    color: bool = False,
+) -> list[str]:
+    lines: list[str] = []
+    marker = result.git_markers.get(".", "") if "git" in config.scan_data else ""
+    _render_root_row(root, config, color, marker, lines)
     stack: list[EntryNode] = []
     if root.kind == "dir":
         stack.extend(reversed(root.children))
     while stack:
         node = stack.pop()
-        plain_name = display_name(node, config.scan_emojis)
+        plain_name = display_relative_path(node, config.scan_emojis)
         marker = result.git_markers.get(node.rel_path, "") if "git" in config.scan_data else ""
-        columns = metadata_columns(node, config.scan_data)[:len(headers)]
-        lines.append(render_padded_row(plain_name, columns, node, width, color, marker=marker))
+        lines.extend(render_node_rows(plain_name, node, config, color, marker))
         if node.kind == "dir" and node.children:
             stack.extend(reversed(node.children))
     return lines
 
 
-def render_tree_lines(root: EntryNode, result: ScanResult, config: RuntimeConfig, color: bool = False) -> list[str]:
+def render_tree_lines(
+    root: EntryNode,
+    result: ScanResult,
+    config: RuntimeConfig,
+    color: bool = False,
+) -> list[str]:
     if "tree" not in config.scan_data:
         return render_flat_entries(root, result, config, color)
-    width = name_column_width(config.scan_data)
     lines: list[str] = []
-    headers = active_header_columns(config.scan_data)
-    root_label = display_name(root, config.scan_emojis)
-    root_marker = result.git_markers.get(".", "") if "git" in config.scan_data else ""
-    if headers and root.kind == "dir":
-        lines.append(render_padded_row(root_label, headers, root, width, color, header=True, marker=root_marker))
-    elif headers:
-        root_columns = metadata_columns(root, config.scan_data)[:len(headers)]
-        lines.append(render_padded_row(root_label, root_columns, root, width, color, marker=root_marker))
-    else:
-        label = f"{root_label} {root_marker}" if root_marker else root_label
-        lines.append(style(truncate_cells(label, width), *row_style_for_node(root, color), enabled=color))
+    marker = result.git_markers.get(".", "") if "git" in config.scan_data else ""
+    _render_root_row(root, config, color, marker, lines)
 
     pending: list[tuple[EntryNode, str, bool]] = []
     if root.kind == "dir":
-        pending.extend((child, "", index == len(root.children) - 1) for index, child in reversed(list(enumerate(root.children))))
+        pending.extend(
+            (child, "", index == len(root.children) - 1) for index, child in reversed(list(enumerate(root.children)))
+        )
     while pending:
         node, prefix, is_last = pending.pop()
         connector = "└── " if is_last else "├── "
         plain_name = visible_node_label(node, prefix, connector, config.scan_emojis)
         marker = result.git_markers.get(node.rel_path, "") if "git" in config.scan_data else ""
-        columns = metadata_columns(node, config.scan_data)[:len(headers)]
-        lines.append(render_padded_row(plain_name, columns, node, width, color, marker=marker))
+        lines.extend(render_node_rows(plain_name, node, config, color, marker))
         if node.kind == "dir" and node.children:
             child_prefix = prefix + ("    " if is_last else "│   ")
             pending.extend(
@@ -2392,16 +3179,23 @@ def deleted_git_entry_visible(entry: DeletedGitEntry, config: RuntimeConfig) -> 
         return False
     path = Path(entry.rel_path)
     node = EntryNode(
-        path=path, rel_path=entry.rel_path, name=path.name,
-        kind=entry.kind, size=entry.size, mtime=0,
+        path=path,
+        rel_path=entry.rel_path,
+        name=path.name,
+        kind=entry.kind,
+        size=entry.size,
+        mtime=0,
     )
-    if config.filter_mode == "ignore" and rules_match(node, config.rules):
-        return False
+    if config.filter_mode == "ignore":
+        ancestor_names = path.parts[:-1]
+        ignored_ancestor = any(name in config.rules.names for name in ancestor_names) or (
+            bool(ancestor_names) and "dir" in config.rules.types
+        )
+        if ignored_ancestor or rules_match(node, config.rules):
+            return False
     if config.filter_mode == "only" and not rules_match(node, config.rules):
         return False
-    if config.ignore_empty and entry.kind == "file" and entry.size == 0:
-        return False
-    return True
+    return not (config.ignore_empty and entry.kind == "file" and entry.size == 0)
 
 
 def render_deleted_git_paths(result: ScanResult, config: RuntimeConfig) -> list[str]:
@@ -2414,15 +3208,28 @@ def render_deleted_git_paths(result: ScanResult, config: RuntimeConfig) -> list[
         present.add(node.rel_path)
         stack.extend(node.children)
     deleted = sorted(
-        entry.rel_path for entry in result.deleted_git_entries
+        entry.rel_path
+        for entry in result.deleted_git_entries
         if entry.rel_path not in present and deleted_git_entry_visible(entry, config)
     )
     if not deleted:
         return []
     width = terminal_columns()
-    return [truncate_cells(f"deleted {sanitize_terminal_text(path)} [D]", width) for path in deleted]
+    return [
+        render_padded_row(
+            f"deleted {sanitize_terminal_text(path)}",
+            (),
+            None,
+            width,
+            False,
+            marker="[D]",
+        ).rstrip()
+        for path in deleted
+    ]
+
 
 # ─── SUMMARY RENDERING ──────────────────────────────────────────────────────
+
 
 def type_counts(root: EntryNode) -> dict[str, int]:
     counts: dict[str, int] = {}
@@ -2481,7 +3288,7 @@ def summary_values(result: ScanResult, footer_width: int | None = None) -> dict[
     link_word = "link" if links == 1 else "links"
     largest = root.largest_file
     newest_path, newest_time = root.newest_entry or (root.summary_path, root.mtime)
-    now = datetime.now()
+    now = datetime.now().astimezone()
     # The footer must fit inside the framed-summary box body (width - 4) when
     # rendered in framed mode; in minimal mode it uses the full terminal width.
     # Callers pass the appropriate width; the default keeps the legacy full-width
@@ -2491,14 +3298,18 @@ def summary_values(result: ScanResult, footer_width: int | None = None) -> dict[
     # counted, so the real total is strictly higher than the number shown.
     lines_label = f"{root.total_lines:,}+? lines" if root.unknown_lines else f"{root.total_lines:,} lines"
     return {
-        "total": SUMMARY_VALUE_SEPARATOR.join((
-            f"{files:,} {file_word}",
-            f"{dirs:,} {dir_word}",
-            f"{links:,} {link_word}",
-            lines_label,
-            format_size(root.size),
-        )),
-        "largest": "none" if largest is None else f"{sanitize_terminal_text(largest[0])}{SUMMARY_VALUE_SEPARATOR}{format_size(largest[1])}",
+        "total": SUMMARY_VALUE_SEPARATOR.join(
+            (
+                f"{files:,} {file_word}",
+                f"{dirs:,} {dir_word}",
+                f"{links:,} {link_word}",
+                lines_label,
+                format_size(root.size),
+            )
+        ),
+        "largest": "none"
+        if largest is None
+        else f"{sanitize_terminal_text(largest[0])}{SUMMARY_VALUE_SEPARATOR}{format_size(largest[1])}",
         "newest": f"{sanitize_terminal_text(newest_path)}{SUMMARY_VALUE_SEPARATOR}{format_age(newest_time)}",
         "types": format_type_counts(type_counts(root)),
         "scanned": _scanned_footer(result.elapsed_ms, now, effective_footer_width),
@@ -2520,7 +3331,11 @@ def render_minimal_summary(result: ScanResult) -> list[str]:
         noun = "issue" if count == 1 else "issues"
         lines.append(f"warnings {count} {noun}; scan output preserved")
     lines.append(values["scanned"])
-    return lines
+    width = terminal_columns()
+    wrapped: list[str] = []
+    for line in lines:
+        wrapped.extend(wrap_cells(line, width))
+    return wrapped
 
 
 def summary_label_line(label: str, value: str, width: int, color: bool, border: str = "unicode") -> str:
@@ -2557,13 +3372,17 @@ def render_framed_summary(result: ScanResult, border: str, color: bool = False) 
         mid = separator
         joined = separator
         bottom = "+" + "-" * (width - 2) + "+"
-        line = lambda text: summary_box_line(text, width, "ascii", color)
+        box_border = "ascii"
     else:
         top = style("┌" + "─" * (width - 2) + "┐", ANSI_DIM, ANSI_CYAN, enabled=color)
         mid = style("├" + "─" * label_dashes + "┬" + "─" * value_dashes + "┤", ANSI_DIM, ANSI_CYAN, enabled=color)
         joined = style("├" + "─" * label_dashes + "┴" + "─" * value_dashes + "┤", ANSI_DIM, ANSI_CYAN, enabled=color)
         bottom = style("└" + "─" * (width - 2) + "┘", ANSI_DIM, ANSI_CYAN, enabled=color)
-        line = lambda text: summary_box_line(text, width, "unicode", color)
+        box_border = "unicode"
+
+    def line(text: str) -> str:
+        return summary_box_line(text, width, box_border, color)
+
     lines = [top]
     lines.extend(line(chunk) for chunk in wrap_cells(values["total"], max(1, width - 4)))
     lines.append(mid)
@@ -2595,7 +3414,12 @@ def render_summary(result: ScanResult, styling: str, color: bool = False) -> lis
     if styling == "full" and terminal_columns() >= SUMMARY_FRAMED_MIN_WIDTH:
         return render_framed_summary(result, "unicode", color)
     values = summary_values(result)
-    lines = [values["total"], f"largest  {values['largest']}", f"newest   {values['newest']}", f"types    {values['types']}"]
+    lines = [
+        values["total"],
+        f"largest  {values['largest']}",
+        f"newest   {values['newest']}",
+        f"types    {values['types']}",
+    ]
     if result.timed_out:
         lines.append("timeout reached; partial result shown")
     if result.warnings:
@@ -2653,7 +3477,9 @@ def render(result: ScanResult, config: RuntimeConfig, color: bool | None = None)
         lines = apply_minimal_ascii(lines)
     return "\n".join(lines) + "\n"
 
+
 # ─── CLIPBOARD ──────────────────────────────────────────────────────────────
+
 
 def clipboard_backend_candidates() -> list[tuple[str, ...]]:
     candidates: list[tuple[str, ...]] = []
@@ -2690,8 +3516,11 @@ def run_clipboard_command(command: Sequence[str], text: str) -> tuple[bool, str 
         return False, None, False
     try:
         result = subprocess.run(
-            [executable, *command[1:]], input=text.encode("utf-8"),
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False,
+            [executable, *command[1:]],
+            input=text.encode("utf-8"),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            check=False,
             timeout=CLIPBOARD_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -2761,9 +3590,7 @@ def copy_to_clipboard(text: str) -> None:
     # session isn't actually reachable even though the env vars suggested it
     # was. Treat as unavailable: warn and continue, exit 0.
     if environment_failures:
-        raise ClipboardUnavailableError(
-            "desktop session not reachable (" + "; ".join(environment_failures) + ")"
-        )
+        raise ClipboardUnavailableError("desktop session not reachable (" + "; ".join(environment_failures) + ")")
     if any_executable_found:
         raise ClipboardFailureError("clipboard backend ran but copy did not complete")
     raise ClipboardUnavailableError("clipboard backend unavailable for this desktop session")
@@ -2771,21 +3598,28 @@ def copy_to_clipboard(text: str) -> None:
 
 # ─── ENTRY POINT ────────────────────────────────────────────────────────────
 
+
 def run(argv: Sequence[str]) -> int:
     try:
         if argv and is_help_token(argv[0]):
+            if len(argv) != 1:
+                raise ConfigError("help does not accept arguments")
             write_stream(sys.stdout, render_help())
             return 0
         if argv and is_version_token(argv[0]):
+            if len(argv) != 1:
+                raise ConfigError("version does not accept arguments")
             write_stream(sys.stdout, render_version())
             return 0
         if argv and is_status_token(argv[0]):
+            if len(argv) != 1:
+                raise ConfigError("status does not accept arguments")
             write_stream(sys.stdout, render_status())
             return 0
-        if any(token in {"-h", "--help"} for token in argv):
+        if option_before_separator(argv, {"-h", "--help"}):
             write_stream(sys.stdout, render_help())
             return 0
-        if any(token == "--version" for token in argv):
+        if option_before_separator(argv, {"--version"}):
             write_stream(sys.stdout, render_version())
             return 0
         config = resolve_runtime_config(argv)
@@ -2821,7 +3655,7 @@ def run(argv: Sequence[str]) -> int:
         write_stream(sys.stderr, render_usage_error(str(exc)))
         return 2
     except PrsError as exc:
-        write_stream(sys.stderr, render_usage_error(str(exc)))
+        write_stream(sys.stderr, render_runtime_error(str(exc)))
         return 1
     except BrokenPipeError:
         # Redirect stdout to devnull so any remaining writes don't retrigger
@@ -2836,11 +3670,15 @@ def run(argv: Sequence[str]) -> int:
             write_stream(sys.stderr, f"{PROGRAM_NAME}: broken-pipe cleanup failed: {exc}\n")
         return 0
     except OSError as exc:
-        write_stream(sys.stderr, render_usage_error(f"operating system error: {sanitize_terminal_text(exc)}"))
+        write_stream(
+            sys.stderr,
+            render_runtime_error(f"operating system error: {sanitize_terminal_text(exc)}"),
+        )
         return 1
     except KeyboardInterrupt:
         write_stream(sys.stderr, f"{PROGRAM_NAME}: interrupted\n")
         return 130
+
 
 def main() -> None:
     raise SystemExit(run(sys.argv[1:]))
