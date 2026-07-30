@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# install.sh -- Project Summarizer installer
-# Installs, validates, repairs, and exposes the prs commands with transactional
+# install.sh -- Scan Dir installer
+# Installs, validates, repairs, and exposes the sdir commands with transactional
 # rollback, package integrity verification, and safe PATH integration.
 # Tags: installer, linux, macos, rollback, integrity
 # 2026-07-28
@@ -9,26 +9,26 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
 
-readonly PRODUCT_TITLE='Project Summarizer'
-readonly PRODUCT_SLUG='project-summarizer'
-readonly PRIMARY_COMMAND='prs'
-readonly ALIAS_COMMAND='project-summarizer'
-readonly RUNTIME_FILE='prs.py'
+readonly PRODUCT_TITLE='Scan Dir'
+readonly PRODUCT_SLUG='scan-dir'
+readonly PRIMARY_COMMAND='sdir'
+readonly ALIAS_COMMAND='scan-dir'
+readonly RUNTIME_FILE='sdir.py'
 readonly CONFIG_FILE='config.yaml'
 readonly SKILL_FILE='SKILL.md'
 readonly MANIFEST_FILE='install-manifest.env'
 readonly VERSION_FILE='.installer-version'
 readonly MANAGED_FILE='.managed'
-readonly MANAGED_MARKER='project-summarizer managed command'
-readonly BRIDGE_MARKER='project-summarizer managed active PATH bridge'
-readonly PATH_BLOCK_BEGIN='# >>> project-summarizer PATH >>>'
-readonly PATH_BLOCK_END='# <<< project-summarizer PATH <<<'
-readonly INSTALLER_VERSION='2026.07.29.2'
+readonly MANAGED_MARKER='scan-dir managed command'
+readonly BRIDGE_MARKER='scan-dir managed active PATH bridge'
+readonly PATH_BLOCK_BEGIN='# >>> scan-dir PATH >>>'
+readonly PATH_BLOCK_END='# <<< scan-dir PATH <<<'
+readonly INSTALLER_VERSION='1.0.0'
 readonly MINIMUM_PYTHON_VERSION='3.10'
-readonly DEFAULT_SOURCE_URL='https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/prs.py'
-readonly DEFAULT_RUNTIME_SHA256='3869db1dbe9eaae8cbe041377021051867c356cf120e6354b8f96be1c6646586'
-readonly DEFAULT_CONFIG_SHA256='54d35498d39f59aec624a9b3caf1d69505e90ea770e449907bf8e5dd4e7189dc'
-readonly DEFAULT_SKILL_SHA256='f01dbff72c481cc47086b30d23dc90b5e3d0abd80eb23fd1af7653ae4e204941'
+readonly DEFAULT_SOURCE_URL='https://raw.githubusercontent.com/vivid0o0/scan-dir/main/sdir.py'
+readonly DEFAULT_RUNTIME_SHA256='ffc456a9e4f66d0df8a6e4bb7b513341d33ea6d0f22c1348d9bb271134b989d4'
+readonly DEFAULT_CONFIG_SHA256='596dadc0702d50e7b46167478d5c05f24909aa5f380ba854cbff2aca4f6d305f'
+readonly DEFAULT_SKILL_SHA256='2d8c071287325026859035fbbb72c687b6ad29ca53a0be5e4af1abe0c2c5104e'
 readonly NETWORK_CONNECT_TIMEOUT=15
 readonly NETWORK_TOTAL_TIMEOUT=300
 readonly NETWORK_RETRIES=3
@@ -42,11 +42,20 @@ readonly DATA_MODE=644
 readonly EXEC_MODE=755
 readonly ROLLBACK_FAILURE_EXIT=70
 
-SOURCE_PATH=${PRS_SOURCE:-}
-SOURCE_URL=${PRS_SOURCE_URL:-}
-RUNTIME_SHA256=${PRS_SOURCE_SHA256:-}
-CONFIG_SHA256=${PRS_CONFIG_SHA256:-}
-SKILL_SHA256=${PRS_SKILL_SHA256:-}
+# Canonical identity of the unpublished pre-1.0 local build. These constants
+# are intentionally isolated to the one-way migration routine; they are not
+# exposed as supported commands or configuration names.
+readonly LEGACY_PRODUCT_SLUG='project-summarizer'
+readonly LEGACY_PRIMARY_COMMAND='prs'
+readonly LEGACY_ALIAS_COMMAND='project-summarizer'
+readonly LEGACY_RUNTIME_FILE='prs.py'
+readonly LEGACY_MANAGED_MARKER='project-summarizer managed command'
+
+SOURCE_PATH=${SDIR_SOURCE:-}
+SOURCE_URL=${SDIR_SOURCE_URL:-}
+RUNTIME_SHA256=${SDIR_SOURCE_SHA256:-}
+CONFIG_SHA256=${SDIR_CONFIG_SHA256:-}
+SKILL_SHA256=${SDIR_SKILL_SHA256:-}
 APP_DIR_OVERRIDE=''
 BIN_DIR_OVERRIDE=''
 STATE_DIR_OVERRIDE=''
@@ -72,6 +81,10 @@ CONFIG_DIR=''
 TMP_ROOT=''
 LOG_DIR=''
 LOG_FILE=''
+LEGACY_APP_DIR=''
+LEGACY_STATE_DIR=''
+LEGACY_CONFIG_DIR=''
+LEGACY_BIN_DIR=''
 PYTHON_BIN=''
 WORK_DIR=''
 STAGED_APP_DIR=''
@@ -171,8 +184,8 @@ Usage:
 
 Package source:
   --source <path>          Install a local package beside config.yaml and SKILL.md
-  --source-url <https-url> Download prs.py and its two sibling package files
-  --sha256 <digest>        Expected SHA-256 for prs.py
+  --source-url <https-url> Download sdir.py and its two sibling package files
+  --sha256 <digest>        Expected SHA-256 for sdir.py
   --config-sha256 <digest> Expected SHA-256 for config.yaml
   --skill-sha256 <digest>  Expected SHA-256 for SKILL.md
 
@@ -258,12 +271,11 @@ render_banner() {
     large)
       printf '%s' "$CYAN"
       cat <<'EOF'
- ____            _           _     ____                                      _
-|  _ \ _ __ ___ (_) ___  ___| |_  / ___| _   _ _ __ ___  _ __ ___   __ _ _ __(_)_______ _ __
-| |_) | '__/ _ \| |/ _ \/ __| __| \___ \| | | | '_ ` _ \| '_ ` _ \ / _` | '__| |_  / _ \ '__|
-|  __/| | | (_) | |  __/ (__| |_   ___) | |_| | | | | | | | | | | | (_| | |  | |/ /  __/ |
-|_|   |_|  \___// |\___|\___|\__| |____/ \__,_|_| |_| |_|_| |_| |_|\__,_|_|  |_/___\___|_|
-              |__/
+  ____                   ____  _
+ / ___|  ___ __ _ _ __  |  _ \(_)_ __
+ \___ \ / __/ _` | '_ \ | | | | | '__|
+  ___) | (_| (_| | | | || |_| | | |
+ |____/ \___\__,_|_| |_||____/|_|_|
 EOF
       printf '%sinstall • repair • validate%s
 ' "$BOLD" "$RESET"
@@ -362,20 +374,27 @@ setup_paths() {
   tmp_base="${TMPDIR:-/tmp}"; [[ "$tmp_base" == /* ]] || tmp_base=/tmp
 
   local explicit
-  for explicit in "${APP_DIR_OVERRIDE:-${PRS_APP_DIR:-}}" "${BIN_DIR_OVERRIDE:-${PRS_BIN_DIR:-}}" "${STATE_DIR_OVERRIDE:-${PRS_STATE_DIR:-}}" "${CONFIG_DIR_OVERRIDE:-${PRS_CONFIG_DIR:-}}" "${TMP_ROOT_OVERRIDE:-${PRS_TMP_ROOT:-}}"; do
+  for explicit in "${APP_DIR_OVERRIDE:-${SDIR_APP_DIR:-}}" "${BIN_DIR_OVERRIDE:-${SDIR_BIN_DIR:-}}" "${STATE_DIR_OVERRIDE:-${SDIR_STATE_DIR:-}}" "${CONFIG_DIR_OVERRIDE:-${SDIR_CONFIG_DIR:-}}" "${TMP_ROOT_OVERRIDE:-${SDIR_TMP_ROOT:-}}"; do
     [[ -z "$explicit" || "$explicit" == /* ]] || fail "explicit managed path must be absolute: $explicit"
   done
   if [[ "$PLATFORM" == darwin ]]; then
-    APP_DIR=${APP_DIR_OVERRIDE:-${PRS_APP_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/app}}
-    STATE_DIR=${STATE_DIR_OVERRIDE:-${PRS_STATE_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/state}}
-    CONFIG_DIR=${CONFIG_DIR_OVERRIDE:-${PRS_CONFIG_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/config}}
+    APP_DIR=${APP_DIR_OVERRIDE:-${SDIR_APP_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/app}}
+    STATE_DIR=${STATE_DIR_OVERRIDE:-${SDIR_STATE_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/state}}
+    CONFIG_DIR=${CONFIG_DIR_OVERRIDE:-${SDIR_CONFIG_DIR:-$HOME/Library/Application Support/$PRODUCT_SLUG/config}}
+    LEGACY_APP_DIR="$HOME/Library/Application Support/$LEGACY_PRODUCT_SLUG/app"
+    LEGACY_STATE_DIR="$HOME/Library/Application Support/$LEGACY_PRODUCT_SLUG/state"
+    LEGACY_CONFIG_DIR="$HOME/Library/Application Support/$LEGACY_PRODUCT_SLUG/config"
   else
-    APP_DIR=${APP_DIR_OVERRIDE:-${PRS_APP_DIR:-$data_base/$PRODUCT_SLUG}}
-    STATE_DIR=${STATE_DIR_OVERRIDE:-${PRS_STATE_DIR:-$state_base/$PRODUCT_SLUG}}
-    CONFIG_DIR=${CONFIG_DIR_OVERRIDE:-${PRS_CONFIG_DIR:-$config_base/$PRODUCT_SLUG}}
+    APP_DIR=${APP_DIR_OVERRIDE:-${SDIR_APP_DIR:-$data_base/$PRODUCT_SLUG}}
+    STATE_DIR=${STATE_DIR_OVERRIDE:-${SDIR_STATE_DIR:-$state_base/$PRODUCT_SLUG}}
+    CONFIG_DIR=${CONFIG_DIR_OVERRIDE:-${SDIR_CONFIG_DIR:-$config_base/$PRODUCT_SLUG}}
+    LEGACY_APP_DIR="$data_base/$LEGACY_PRODUCT_SLUG"
+    LEGACY_STATE_DIR="$state_base/$LEGACY_PRODUCT_SLUG"
+    LEGACY_CONFIG_DIR="$config_base/$LEGACY_PRODUCT_SLUG"
   fi
-  BIN_DIR=${BIN_DIR_OVERRIDE:-${PRS_BIN_DIR:-$bin_base}}
-  TMP_ROOT=${TMP_ROOT_OVERRIDE:-${PRS_TMP_ROOT:-$tmp_base}}
+  BIN_DIR=${BIN_DIR_OVERRIDE:-${SDIR_BIN_DIR:-$bin_base}}
+  LEGACY_BIN_DIR=$BIN_DIR
+  TMP_ROOT=${TMP_ROOT_OVERRIDE:-${SDIR_TMP_ROOT:-$tmp_base}}
 
   APP_DIR="$(physical_path "$APP_DIR")" || fail 'unable to resolve application directory'
   STATE_DIR="$(physical_path "$STATE_DIR")" || fail 'unable to resolve state directory'
@@ -383,6 +402,10 @@ setup_paths() {
   BIN_DIR="$(physical_path "$BIN_DIR")" || fail 'unable to resolve binary directory'
   TMP_ROOT="$(physical_path "$TMP_ROOT")" || fail 'unable to resolve temporary directory'
   LOG_DIR="$(physical_path "$STATE_DIR/logs")" || fail 'unable to resolve log directory'
+  LEGACY_APP_DIR="$(physical_path "$LEGACY_APP_DIR")" || fail 'unable to resolve legacy application directory'
+  LEGACY_STATE_DIR="$(physical_path "$LEGACY_STATE_DIR")" || fail 'unable to resolve legacy state directory'
+  LEGACY_CONFIG_DIR="$(physical_path "$LEGACY_CONFIG_DIR")" || fail 'unable to resolve legacy config directory'
+  LEGACY_BIN_DIR="$(physical_path "$LEGACY_BIN_DIR")" || fail 'unable to resolve legacy binary directory'
   path_is_within "$LOG_DIR" "$STATE_DIR" || fail "log directory escapes state directory: $LOG_DIR"
 
   validate_managed_path 'application directory' "$APP_DIR"
@@ -941,7 +964,7 @@ def remove_partial():
 
 signal.signal(signal.SIGALRM, alarm_handler)
 opener = urllib.request.build_opener(HTTPSOnly())
-request = urllib.request.Request(url, headers={"User-Agent": "project-summarizer-installer"})
+request = urllib.request.Request(url, headers={"User-Agent": "scan-dir-installer"})
 last_error = None
 try:
     for attempt in range(retries + 1):
@@ -1165,7 +1188,7 @@ PY
   PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -S "$RESOLVED_RUNTIME" help >/dev/null
   local fixture output
   fixture=$(mktemp -d "$WORK_DIR/fixture.XXXXXX"); printf 'demo\n' > "$fixture/README.md"
-  output=$(PRS_CONFIG_DIR="$CONFIG_DIR" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -S "$RESOLVED_RUNTIME" "$fixture" --config "$RESOLVED_CONFIG" --only -e .md --include-hidden --include-empty --scan-data 'tree,summary' --scan-styling minimal --scan-emojis false --auto-copy false)
+  output=$(SDIR_CONFIG_DIR="$CONFIG_DIR" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -S "$RESOLVED_RUNTIME" "$fixture" --config "$RESOLVED_CONFIG" --only -e .md --include-hidden --include-empty --scan-data 'tree,summary' --scan-styling minimal --scan-emojis false --auto-copy false)
   [[ "$output" == *README.md* && "$output" == *largest* ]] || fail 'source runtime validation failed'
 }
 
@@ -1334,12 +1357,12 @@ is_managed_wrapper() {
   quoted_app="APP_DIR=$(shell_quote "$APP_DIR")"
   plain_app="APP_DIR=$APP_DIR"
   grep -Fqx '#!/usr/bin/env bash' "$target" 2>/dev/null || return 1
-  grep -Fqx "# $command_name -- Project Summarizer command" "$target" 2>/dev/null || return 1
+  grep -Fqx "# $command_name -- Scan Dir command" "$target" 2>/dev/null || return 1
   grep -Fqx "# $MANAGED_MARKER" "$target" 2>/dev/null || return 1
   if ! grep -Fqx "$quoted_app" "$target" 2>/dev/null && ! grep -Fqx "$plain_app" "$target" 2>/dev/null; then
     return 1
   fi
-  source_line="SOURCE_FILE=\"${dollar}APP_DIR/prs.py\""
+  source_line="SOURCE_FILE=\"${dollar}APP_DIR/sdir.py\""
   exec_line="exec \"${dollar}PYTHON_BIN\" -S \"${dollar}SOURCE_FILE\" \"${dollar}@\""
   grep -Fqx "$source_line" "$target" 2>/dev/null || return 1
   grep -Fqx "$exec_line" "$target" 2>/dev/null
@@ -1373,14 +1396,14 @@ write_wrapper() {
   temp=$TEMP_PATH
   cat > "$temp" <<EOF
 #!/usr/bin/env bash
-# $command_name -- Project Summarizer command
+# $command_name -- Scan Dir command
 # $MANAGED_MARKER
 set -Eeuo pipefail
 APP_DIR=$(shell_quote "$app_dir")
 PYTHON_BIN=$(shell_quote "$python_bin")
-export PRS_CONFIG_DIR=$(shell_quote "$config_dir")
+export SDIR_CONFIG_DIR=$(shell_quote "$config_dir")
 SOURCE_FILE="\$APP_DIR/$RUNTIME_FILE"
-if [[ ! -r "\$SOURCE_FILE" ]]; then printf 'prs: managed runtime missing: %s\\n' "\$SOURCE_FILE" >&2; exit 127; fi
+if [[ ! -r "\$SOURCE_FILE" ]]; then printf 'sdir: managed runtime missing: %s\\n' "\$SOURCE_FILE" >&2; exit 127; fi
 if [[ ! -x "\$PYTHON_BIN" ]] || ! "\$PYTHON_BIN" -S - '$MINIMUM_PYTHON_VERSION' <<'PY' >/dev/null 2>&1
 import sys
 v=tuple(map(int,sys.argv[1].split('.')))
@@ -1401,7 +1424,7 @@ import sys
 v=tuple(map(int,sys.argv[1].split('.')))
 raise SystemExit(0 if sys.version_info>=v else 1)
 PY
-then printf 'prs: Python $MINIMUM_PYTHON_VERSION+ is unavailable. Re-run install.sh.\\n' >&2; exit 127; fi
+then printf 'sdir: Python $MINIMUM_PYTHON_VERSION+ is unavailable. Re-run install.sh.\\n' >&2; exit 127; fi
 export PYTHONDONTWRITEBYTECODE=1
 exec "\$PYTHON_BIN" -S "\$SOURCE_FILE" "\$@"
 EOF
@@ -1422,7 +1445,7 @@ stage_package() {
   printf '%s\n' "$INSTALLER_VERSION" > "$STAGED_APP_DIR/$VERSION_FILE"
   printf '%s\n' "$MANAGED_MARKER" > "$STAGED_APP_DIR/$MANAGED_FILE"
   chmod "$DATA_MODE" "$STAGED_APP_DIR/$VERSION_FILE" "$STAGED_APP_DIR/$MANAGED_FILE"
-  require_version "$(PRS_CONFIG_DIR="$CONFIG_DIR" "$PYTHON_BIN" -S "$STAGED_APP_DIR/$RUNTIME_FILE" version)" staged
+  require_version "$(SDIR_CONFIG_DIR="$CONFIG_DIR" "$PYTHON_BIN" -S "$STAGED_APP_DIR/$RUNTIME_FILE" version)" staged
 }
 
 commit_package() {
@@ -1572,7 +1595,7 @@ path=pathlib.Path(sys.argv[1]); bindir=sys.argv[2]; begin=sys.argv[3].encode(); 
 old=path.read_bytes() if path.exists() else b''
 mode=stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
 start=old.find(begin); finish=old.find(end)
-if (start<0) != (finish<0) or (start>=0 and finish<start): raise SystemExit('malformed project-summarizer PATH block')
+if (start<0) != (finish<0) or (start>=0 and finish<start): raise SystemExit('malformed scan-dir PATH block')
 raw=os.fsencode(bindir)
 posix_quoted=b"'"+raw.replace(b"'", b"'\\''")+b"'"
 fish_quoted=b"'"+raw.replace(b"\\", b"\\\\").replace(b"'", b"\\'")+b"'"
@@ -1648,6 +1671,154 @@ validate_installed() {
   [[ "$output" == *README.md* && "$output" == *largest* ]] || fail 'installed runtime validation failed'
 }
 
+legacy_app_layout_is_owned() {
+  [[ "$LEGACY_APP_DIR" != "$APP_DIR" ]] || return 1
+  "$PYTHON_BIN" -S - "$LEGACY_APP_DIR" "$LEGACY_MANAGED_MARKER" <<'PY' >/dev/null 2>&1
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+marker = sys.argv[2]
+allowed = {
+    ".installer-version",
+    ".managed",
+    "SKILL.md",
+    "config.yaml",
+    "install-manifest.env",
+    "prs.py",
+}
+info = root.lstat()
+mode = stat.S_IMODE(info.st_mode)
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or mode & 0o022:
+    raise SystemExit(1)
+entries = {entry.name for entry in root.iterdir()}
+if not entries <= allowed or ".managed" not in entries:
+    raise SystemExit(1)
+for entry in root.iterdir():
+    item = entry.lstat()
+    if not stat.S_ISREG(item.st_mode) or item.st_uid != os.getuid():
+        raise SystemExit(1)
+if (root / ".managed").read_text(encoding="utf-8").rstrip("\n") != marker:
+    raise SystemExit(1)
+PY
+}
+
+legacy_state_layout_is_owned() {
+  [[ "$LEGACY_STATE_DIR" != "$STATE_DIR" ]] || return 1
+  [[ ! -e "$LEGACY_STATE_DIR" && ! -L "$LEGACY_STATE_DIR" ]] && return 0
+  "$PYTHON_BIN" -S - "$LEGACY_STATE_DIR" <<'PY' >/dev/null 2>&1
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+info = root.lstat()
+if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+    raise SystemExit(1)
+for entry in root.rglob("*"):
+    item = entry.lstat()
+    if item.st_uid != os.getuid() or stat.S_ISLNK(item.st_mode):
+        raise SystemExit(1)
+    relative = entry.relative_to(root)
+    if stat.S_ISDIR(item.st_mode):
+        if relative.parts != ("logs",):
+            raise SystemExit(1)
+    elif stat.S_ISREG(item.st_mode):
+        if len(relative.parts) != 2 or relative.parts[0] != "logs" or not relative.name.startswith("install") or ".log" not in relative.name:
+            raise SystemExit(1)
+    else:
+        raise SystemExit(1)
+PY
+}
+
+legacy_wrapper_is_owned() {
+  local target=$1 command_name=$2 dollar='$' source_line exec_line quoted_app plain_app
+  [[ -f "$target" && ! -L "$target" && -O "$target" ]] || return 1
+  grep -Fqx '#!/usr/bin/env bash' "$target" 2>/dev/null || return 1
+  grep -Fqx "# $command_name -- Project Summarizer command" "$target" 2>/dev/null || return 1
+  grep -Fqx "# $LEGACY_MANAGED_MARKER" "$target" 2>/dev/null || return 1
+  quoted_app="APP_DIR=$(shell_quote "$LEGACY_APP_DIR")"
+  plain_app="APP_DIR=$LEGACY_APP_DIR"
+  if ! grep -Fqx "$quoted_app" "$target" 2>/dev/null && ! grep -Fqx "$plain_app" "$target" 2>/dev/null; then
+    return 1
+  fi
+  source_line="SOURCE_FILE=\"${dollar}APP_DIR/$LEGACY_RUNTIME_FILE\""
+  exec_line="exec \"${dollar}PYTHON_BIN\" -S \"${dollar}SOURCE_FILE\" \"${dollar}@\""
+  grep -Fqx "$source_line" "$target" 2>/dev/null || return 1
+  grep -Fqx "$exec_line" "$target" 2>/dev/null
+}
+
+migrate_legacy_user_config() {
+  local old="$LEGACY_CONFIG_DIR/$CONFIG_FILE" new="$CONFIG_DIR/$CONFIG_FILE" temp
+  [[ "$LEGACY_CONFIG_DIR" != "$CONFIG_DIR" ]] || return 0
+  [[ -e "$old" || -L "$old" ]] || {
+    if [[ -d "$LEGACY_CONFIG_DIR" && ! -L "$LEGACY_CONFIG_DIR" ]]; then rmdir "$LEGACY_CONFIG_DIR" 2>/dev/null || true; fi
+    return 0
+  }
+  if [[ ! -f "$old" || -L "$old" || ! -O "$old" ]]; then
+    warn "legacy user configuration was not migrated because it is not a safe current-user regular file: $old"
+    return 0
+  fi
+  ensure_dir "$CONFIG_DIR" "$DIR_MODE"
+  secure_owned_directory 'config directory' "$CONFIG_DIR"
+  if [[ -e "$new" || -L "$new" ]]; then
+    if [[ -f "$new" && ! -L "$new" ]] && cmp -s "$old" "$new"; then
+      rm -f "$old" || warn "unable to remove duplicate legacy user configuration: $old"
+    else
+      warn "legacy user configuration differs from the existing Scan Dir configuration and was preserved: $old"
+      return 0
+    fi
+  else
+    make_sibling_temp "$new"
+    temp=$TEMP_PATH
+    cp "$old" "$temp"
+    chmod "$PRIVATE_MODE" "$temp"
+    mv "$temp" "$new"
+    record_created_file "$new"
+    rm -f "$old" || warn "legacy user configuration was copied but could not be removed: $old"
+  fi
+  rmdir "$LEGACY_CONFIG_DIR" 2>/dev/null || true
+}
+
+cleanup_legacy_install() {
+  [[ "$DRY_RUN" == 0 ]] || return 0
+  migrate_legacy_user_config
+
+  local primary="$LEGACY_BIN_DIR/$LEGACY_PRIMARY_COMMAND"
+  local alias="$LEGACY_BIN_DIR/$LEGACY_ALIAS_COMMAND"
+  local app_present=0 unsafe=0
+  [[ -e "$LEGACY_APP_DIR" || -L "$LEGACY_APP_DIR" ]] && app_present=1
+
+  if [[ "$app_present" == 1 ]] && ! legacy_app_layout_is_owned; then
+    warn "legacy runtime was preserved because ownership or layout could not be proven: $LEGACY_APP_DIR"
+    return 0
+  fi
+  if [[ -e "$primary" || -L "$primary" ]]; then
+    legacy_wrapper_is_owned "$primary" "$LEGACY_PRIMARY_COMMAND" || unsafe=1
+  fi
+  if [[ -e "$alias" || -L "$alias" ]]; then
+    legacy_wrapper_is_owned "$alias" "$LEGACY_ALIAS_COMMAND" || unsafe=1
+  fi
+  if [[ "$unsafe" == 1 ]]; then
+    warn "legacy commands were preserved because ownership could not be proven in $LEGACY_BIN_DIR"
+    return 0
+  fi
+
+  [[ ! -e "$primary" && ! -L "$primary" ]] || rm -f "$primary" || warn "unable to remove legacy command: $primary"
+  [[ ! -e "$alias" && ! -L "$alias" ]] || rm -f "$alias" || warn "unable to remove legacy command: $alias"
+  if [[ "$app_present" == 1 ]]; then
+    rm -rf "$LEGACY_APP_DIR" || warn "unable to remove legacy runtime: $LEGACY_APP_DIR"
+  fi
+  if legacy_state_layout_is_owned; then
+    [[ ! -e "$LEGACY_STATE_DIR" && ! -L "$LEGACY_STATE_DIR" ]] || rm -rf "$LEGACY_STATE_DIR" || warn "unable to remove legacy state: $LEGACY_STATE_DIR"
+  elif [[ -e "$LEGACY_STATE_DIR" || -L "$LEGACY_STATE_DIR" ]]; then
+    warn "legacy state was preserved because ownership or layout could not be proven: $LEGACY_STATE_DIR"
+  fi
+}
+
 finalize() {
   local backup
   # The installation has already passed direct command and manifest integrity
@@ -1706,6 +1877,7 @@ main() {
     step 'repair active PATH integration' create_active_bridge
     step 'repair shell PATH' repair_path
     step 'validate installed commands' validate_installed
+    step 'migrate legacy installation' cleanup_legacy_install
     finalize
     say "Already installed ($INSTALLER_VERSION); integrity verified."
     return 0
@@ -1725,6 +1897,7 @@ main() {
   step 'write integrity manifest' write_manifest
   read_install_metadata
   installed_is_intact || fail 'post-install integrity verification failed'
+  step 'migrate legacy installation' cleanup_legacy_install
   finalize
   print_summary
 }

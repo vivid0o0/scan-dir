@@ -11,7 +11,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
-RUNTIME = ROOT / "prs.py"
+RUNTIME = ROOT / "sdir.py"
 VERSION = re.search(r'^VERSION = "([^"]+)"$', RUNTIME.read_text(), re.MULTILINE).group(1)
 
 
@@ -105,19 +105,19 @@ def snapshot_tree(path: Path) -> dict[str, tuple[str, int]]:
 
 def assert_installed(p: dict[str, Path], config: Path | None = None) -> None:
     expected_config = config or p["config"]
-    primary = p["bin"] / "prs"
-    alias = p["bin"] / "project-summarizer"
+    primary = p["bin"] / "sdir"
+    alias = p["bin"] / "scan-dir"
     assert (
         subprocess.run([primary, "version"], text=True, capture_output=True, check=True).stdout.strip()
-        == f"prs {VERSION}"
+        == f"sdir {VERSION}"
     )
     assert (
         subprocess.run([alias, "version"], text=True, capture_output=True, check=True).stdout.strip()
-        == f"prs {VERSION}"
+        == f"sdir {VERSION}"
     )
-    assignment = next(line for line in primary.read_text().splitlines() if line.startswith("export PRS_CONFIG_DIR="))
+    assignment = next(line for line in primary.read_text().splitlines() if line.startswith("export SDIR_CONFIG_DIR="))
     resolved_config = subprocess.run(
-        ["bash", "-c", f'{assignment}; printf "%s" "$PRS_CONFIG_DIR"'],
+        ["bash", "-c", f'{assignment}; printf "%s" "$SDIR_CONFIG_DIR"'],
         text=True,
         capture_output=True,
         check=True,
@@ -143,12 +143,12 @@ def test_install_is_idempotent_and_reconfigures(tmp_path: Path) -> None:
     assert first.returncode == 0, first.stderr
     assert_installed(p)
     app_inode = p["app"].stat().st_ino
-    primary_digest = digest(p["bin"] / "prs")
+    primary_digest = digest(p["bin"] / "sdir")
 
     second = run_install(p)
     assert second.returncode == 0, second.stderr
     assert p["app"].stat().st_ino == app_inode
-    assert digest(p["bin"] / "prs") == primary_digest
+    assert digest(p["bin"] / "sdir") == primary_digest
 
     alternate_config = tmp_path / "alternate-config"
     changed = run_install(p, config=alternate_config)
@@ -165,8 +165,8 @@ def test_install_is_idempotent_and_reconfigures(tmp_path: Path) -> None:
 def test_integrity_repairs_content_modes_and_layout(tmp_path: Path) -> None:
     p = paths(tmp_path)
     assert run_install(p).returncode == 0
-    runtime = p["app"] / "prs.py"
-    primary = p["bin"] / "prs"
+    runtime = p["app"] / "sdir.py"
+    primary = p["bin"] / "sdir"
     runtime.write_text("corrupted\n")
     primary.chmod(0o777)
     (p["app"] / "unexpected").write_text("foreign\n")
@@ -183,7 +183,7 @@ def test_foreign_command_requires_force(tmp_path: Path) -> None:
     p = paths(tmp_path)
     p["bin"].mkdir()
     p["bin"].chmod(0o755)
-    foreign = p["bin"] / "prs"
+    foreign = p["bin"] / "sdir"
     foreign.write_text("#!/bin/sh\necho foreign\n")
     foreign.chmod(0o755)
 
@@ -243,7 +243,7 @@ def test_post_commit_failure_rolls_back(tmp_path: Path) -> None:
         env_overrides={
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "REAL_MV": str(real_mv),
-            "FAIL_COMMIT_DESTINATION": str(p["bin"] / "prs"),
+            "FAIL_COMMIT_DESTINATION": str(p["bin"] / "sdir"),
         },
     )
     assert failed.returncode != 0
@@ -272,7 +272,7 @@ def test_failed_rollback_preserves_previous_installation_backup(tmp_path: Path) 
         env_overrides={
             "PATH": f"{fake_bin}:{os.environ['PATH']}",
             "REAL_MV": str(real_mv),
-            "FAIL_COMMIT_DESTINATION": str(p["bin"] / "prs"),
+            "FAIL_COMMIT_DESTINATION": str(p["bin"] / "sdir"),
             "FAIL_ROLLBACK_APP": "1",
         },
     )
@@ -328,7 +328,7 @@ def test_lock_identity_protects_shared_command_directory(tmp_path: Path) -> None
     p = paths(tmp_path)
     p["bin"].mkdir()
     p["bin"].chmod(0o755)
-    bin_lock = p["bin"] / ".project-summarizer.install.lock"
+    bin_lock = p["bin"] / ".scan-dir.install.lock"
     write_live_lock(bin_lock)
 
     alternate = dict(p)
@@ -373,7 +373,7 @@ def test_wrapper_quotes_paths_with_spaces_and_apostrophes(tmp_path: Path) -> Non
     user_config = p["config"] / "config.yaml"
     user_config.write_text("scan-styling: minimal\n", encoding="utf-8")
     status = subprocess.run(
-        [p["bin"] / "prs", "status"],
+        [p["bin"] / "sdir", "status"],
         env={**os.environ, "COLUMNS": "1000", "NO_COLOR": "1"},
         text=True,
         capture_output=True,
@@ -397,22 +397,51 @@ def test_installer_help_and_argument_validation(tmp_path: Path) -> None:
     assert relative.returncode != 0 and "explicit managed path must be absolute" in relative.stderr
 
     mixed_args = install_args(p)
-    mixed_args.extend(["--source-url", "https://example.com/prs.py"])
+    mixed_args.extend(["--source-url", "https://example.com/sdir.py"])
     mixed = run_installer(p, mixed_args)
     assert mixed.returncode != 0 and "mutually exclusive" in mixed.stderr
+
+
+def test_every_installer_logo_color_and_help_interaction(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    for mode in ("auto", "text", "small", "medium", "large"):
+        arguments = install_args(p)
+        arguments[arguments.index("--logo") + 1] = mode
+        arguments.append("--dry-run")
+        result = run_installer(p, arguments)
+        assert result.returncode == 0, (mode, result.stderr)
+        assert not p["app"].exists()
+    for mode in ("auto", "always", "never"):
+        arguments = install_args(p)
+        arguments[arguments.index("--color") + 1] = mode
+        arguments.append("--dry-run")
+        result = run_installer(p, arguments)
+        assert result.returncode == 0, (mode, result.stderr)
+        assert not p["app"].exists()
+
+    short_help = run_installer(p, ["-h"])
+    assert short_help.returncode == 0
+    assert "Usage:" in short_help.stdout
+    for option, value, message in (
+        ("--logo", "huge", "invalid logo mode"),
+        ("--color", "sometimes", "invalid color mode"),
+    ):
+        invalid = run_installer(p, [option, value])
+        assert invalid.returncode != 0
+        assert message in invalid.stderr
 
 
 def test_custom_remote_requires_digests_before_download(tmp_path: Path) -> None:
     p = paths(tmp_path)
     arguments = install_args(p)
     source_index = arguments.index("--source")
-    arguments[source_index : source_index + 2] = ["--source-url", "https://example.com/prs.py"]
+    arguments[source_index : source_index + 2] = ["--source-url", "https://example.com/sdir.py"]
     result = run_installer(p, arguments)
     assert result.returncode != 0
     assert "custom remote packages require" in result.stderr
     assert not p["app"].exists()
 
-    arguments[source_index + 1] = "https://user@example.com/prs.py"
+    arguments[source_index + 1] = "https://user@example.com/sdir.py"
     invalid = run_installer(p, arguments)
     assert invalid.returncode != 0
     assert "absolute HTTPS file URL" in invalid.stderr
@@ -433,8 +462,8 @@ def test_shell_path_repair_is_idempotent_and_preserves_profile(tmp_path: Path) -
 
     for profile in (bashrc, p["home"] / ".profile"):
         content = profile.read_text(encoding="utf-8")
-        assert content.count("# >>> project-summarizer PATH >>>") == 1
-        assert content.count("# <<< project-summarizer PATH <<<") == 1
+        assert content.count("# >>> scan-dir PATH >>>") == 1
+        assert content.count("# <<< scan-dir PATH <<<") == 1
         assert str(p["bin"]) in content
     assert bashrc.read_text(encoding="utf-8").startswith("export KEEP=1\n")
     assert stat.S_IMODE(bashrc.stat().st_mode) == 0o640
@@ -453,11 +482,41 @@ def test_active_path_bridge_is_safe_and_functional(tmp_path: Path) -> None:
         env_overrides={"PATH": f"{active_bin}:{os.environ['PATH']}"},
     )
     assert result.returncode == 0, result.stderr
-    for command in ("prs", "project-summarizer"):
+    for command in ("sdir", "scan-dir"):
         bridge = active_bin / command
-        assert "project-summarizer managed active PATH bridge" in bridge.read_text(encoding="utf-8")
+        assert "scan-dir managed active PATH bridge" in bridge.read_text(encoding="utf-8")
         version = subprocess.run([bridge, "version"], text=True, capture_output=True, check=True).stdout.strip()
-        assert version == f"prs {VERSION}"
+        assert version == f"sdir {VERSION}"
+
+
+def test_managed_install_with_unverifiable_version_requires_force(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    p["app"].mkdir()
+    p["app"].chmod(0o700)
+    (p["app"] / ".managed").write_text("scan-dir managed command\n", encoding="utf-8")
+    sentinel = p["app"] / "preserve-until-forced"
+    sentinel.write_text("old managed data\n", encoding="utf-8")
+
+    refused = run_install(p)
+    assert refused.returncode != 0
+    assert "managed installation version cannot be verified" in refused.stderr
+    assert sentinel.read_text(encoding="utf-8") == "old managed data\n"
+
+    forced = run_install(p, "--force")
+    assert forced.returncode == 0, forced.stderr
+    assert not sentinel.exists()
+    assert_installed(p)
+
+
+def test_local_package_is_auto_detected_beside_installer(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    arguments = install_args(p)
+    source_index = arguments.index("--source")
+    del arguments[source_index : source_index + 2]
+
+    result = run_installer(p, arguments)
+    assert result.returncode == 0, result.stderr
+    assert_installed(p)
 
 
 def test_newer_installation_requires_force_for_downgrade(tmp_path: Path) -> None:
@@ -480,10 +539,7 @@ def test_newer_installation_requires_force_for_downgrade(tmp_path: Path) -> None
     assert_installed(p)
 
 
-def test_custom_remote_package_install_uses_pinned_digests(tmp_path: Path) -> None:
-    p = paths(tmp_path)
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
+def write_fake_package_curl(fake_bin: Path) -> None:
     fake_curl = fake_bin / "curl"
     fake_curl.write_text(
         """#!/usr/bin/env bash
@@ -508,11 +564,13 @@ cp "$FAKE_PACKAGE_DIR/${url##*/}" "$output"
     )
     fake_curl.chmod(0o755)
 
+
+def pinned_remote_args(p: dict[str, Path]) -> list[str]:
     arguments = install_args(p)
     source_index = arguments.index("--source")
     arguments[source_index : source_index + 2] = [
         "--source-url",
-        "https://example.com/releases/prs.py",
+        "https://example.com/releases/sdir.py",
         "--sha256",
         digest(RUNTIME),
         "--config-sha256",
@@ -520,6 +578,16 @@ cp "$FAKE_PACKAGE_DIR/${url##*/}" "$output"
         "--skill-sha256",
         digest(ROOT / "SKILL.md"),
     ]
+    return arguments
+
+
+def test_custom_remote_package_install_uses_pinned_digests(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    write_fake_package_curl(fake_bin)
+
+    arguments = pinned_remote_args(p)
     result = run_installer(
         p,
         arguments,
@@ -530,6 +598,27 @@ cp "$FAKE_PACKAGE_DIR/${url##*/}" "$output"
     )
     assert result.returncode == 0, result.stderr
     assert_installed(p)
+
+
+def test_pinned_remote_package_dry_run_downloads_validates_and_commits_nothing(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    write_fake_package_curl(fake_bin)
+    arguments = [*pinned_remote_args(p), "--dry-run"]
+
+    result = run_installer(
+        p,
+        arguments,
+        env_overrides={
+            "FAKE_PACKAGE_DIR": str(ROOT),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    for name in ("app", "bin", "state", "config"):
+        assert not p[name].exists()
+    assert list(p["tmp"].iterdir()) == []
 
 
 def test_python_download_fallback_installs_pinned_remote_package(tmp_path: Path) -> None:
@@ -574,7 +663,7 @@ exec "$REAL_PYTHON" "$@"
     source_index = arguments.index("--source")
     arguments[source_index : source_index + 2] = [
         "--source-url",
-        "https://example.com/releases/prs.py",
+        "https://example.com/releases/sdir.py",
         "--sha256",
         digest(RUNTIME),
         "--config-sha256",
@@ -604,9 +693,9 @@ def test_foreign_marker_text_does_not_claim_command_ownership(tmp_path: Path) ->
     p = paths(tmp_path)
     p["bin"].mkdir()
     p["bin"].chmod(0o755)
-    foreign = p["bin"] / "prs"
+    foreign = p["bin"] / "sdir"
     foreign.write_text(
-        "#!/bin/sh\n# project-summarizer managed command\necho foreign\n",
+        "#!/bin/sh\n# scan-dir managed command\necho foreign\n",
         encoding="utf-8",
     )
     foreign.chmod(0o755)
@@ -622,9 +711,9 @@ def test_foreign_bridge_marker_does_not_claim_bridge_ownership(tmp_path: Path) -
     p = paths(tmp_path)
     active_bin = p["home"] / ".local" / "bin"
     active_bin.mkdir(parents=True)
-    foreign = active_bin / "prs"
+    foreign = active_bin / "sdir"
     foreign.write_text(
-        "#!/usr/bin/env bash\n# project-summarizer managed active PATH bridge\nprintf 'foreign\\n'\n",
+        "#!/usr/bin/env bash\n# scan-dir managed active PATH bridge\nprintf 'foreign\\n'\n",
         encoding="utf-8",
     )
     foreign.chmod(0o755)
@@ -641,35 +730,90 @@ def test_foreign_bridge_marker_does_not_claim_bridge_ownership(tmp_path: Path) -
     assert_installed(p)
 
 
-def test_legacy_managed_install_migrates_without_force(tmp_path: Path) -> None:
-    p = paths(tmp_path)
-    p["app"].mkdir()
-    p["app"].chmod(0o700)
+def create_legacy_install(p: dict[str, Path], *, foreign_wrapper: bool = False) -> dict[str, Path]:
+    legacy = {
+        "app": p["home"] / ".local" / "share" / "project-summarizer",
+        "state": p["home"] / ".local" / "state" / "project-summarizer",
+        "config": p["home"] / ".config" / "project-summarizer",
+    }
+    legacy["app"].mkdir(parents=True)
+    legacy["app"].chmod(0o700)
+    (legacy["app"] / ".managed").write_text("project-summarizer managed command\n", encoding="utf-8")
+    (legacy["app"] / ".installer-version").write_text("2026.07.29.2\n", encoding="utf-8")
+    (legacy["app"] / "prs.py").write_text("# legacy runtime\n", encoding="utf-8")
+    (legacy["app"] / "config.yaml").write_text("scan-styling: low\n", encoding="utf-8")
+    (legacy["app"] / "SKILL.md").write_text("legacy skill\n", encoding="utf-8")
+
+    logs = legacy["state"] / "logs"
+    logs.mkdir(parents=True)
+    legacy["state"].chmod(0o700)
+    logs.chmod(0o700)
+    (logs / "install.log").write_text("legacy log\n", encoding="utf-8")
+
+    legacy["config"].mkdir(parents=True)
+    legacy["config"].chmod(0o700)
+    (legacy["config"] / "config.yaml").write_text("scan-styling: minimal\n", encoding="utf-8")
+
     p["bin"].mkdir()
     p["bin"].chmod(0o755)
-    (p["app"] / ".managed").write_text(
-        "project-summarizer managed command\n",
-        encoding="utf-8",
-    )
-    (p["app"] / ".installer-version").write_text("2026.07.26.1\n", encoding="utf-8")
     for command in ("prs", "project-summarizer"):
         wrapper = p["bin"] / command
-        wrapper.write_text(
-            "#!/usr/bin/env bash\n"
-            f"# {command} -- Project Summarizer command\n"
-            "# project-summarizer managed command\n"
-            "set -Eeuo pipefail\n"
-            f"APP_DIR={p['app']}\n"
-            "PYTHON_BIN=/usr/bin/python3\n"
-            'SOURCE_FILE="$APP_DIR/prs.py"\n'
-            'exec "$PYTHON_BIN" -S "$SOURCE_FILE" "$@"\n',
-            encoding="utf-8",
-        )
+        if foreign_wrapper and command == "prs":
+            wrapper.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+        else:
+            wrapper.write_text(
+                "#!/usr/bin/env bash\n"
+                f"# {command} -- Project Summarizer command\n"
+                "# project-summarizer managed command\n"
+                "set -Eeuo pipefail\n"
+                f"APP_DIR={legacy['app']}\n"
+                "PYTHON_BIN=/usr/bin/python3\n"
+                'SOURCE_FILE="$APP_DIR/prs.py"\n'
+                'exec "$PYTHON_BIN" -S "$SOURCE_FILE" "$@"\n',
+                encoding="utf-8",
+            )
         wrapper.chmod(0o755)
+    return legacy
+
+
+def test_legacy_managed_install_migrates_config_and_is_removed(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    legacy = create_legacy_install(p)
 
     result = run_install(p)
     assert result.returncode == 0, result.stderr
     assert_installed(p)
+    assert (p["config"] / "config.yaml").read_text(encoding="utf-8") == "scan-styling: minimal\n"
+    assert stat.S_IMODE((p["config"] / "config.yaml").stat().st_mode) == 0o600
+    assert not legacy["app"].exists()
+    assert not legacy["state"].exists()
+    assert not legacy["config"].exists()
+    assert not (p["bin"] / "prs").exists()
+    assert not (p["bin"] / "project-summarizer").exists()
+
+
+def test_legacy_cleanup_preserves_unproven_command_and_runtime(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    legacy = create_legacy_install(p, foreign_wrapper=True)
+
+    result = run_install(p)
+    assert result.returncode == 0, result.stderr
+    assert_installed(p)
+    assert legacy["app"].exists()
+    assert legacy["state"].exists()
+    assert (p["bin"] / "prs").read_text(encoding="utf-8") == "#!/bin/sh\necho foreign\n"
+
+
+def test_legacy_config_conflict_is_preserved(tmp_path: Path) -> None:
+    p = paths(tmp_path)
+    legacy = create_legacy_install(p)
+    p["config"].mkdir()
+    (p["config"] / "config.yaml").write_text("scan-styling: full\n", encoding="utf-8")
+
+    result = run_install(p)
+    assert result.returncode == 0, result.stderr
+    assert (p["config"] / "config.yaml").read_text(encoding="utf-8") == "scan-styling: full\n"
+    assert (legacy["config"] / "config.yaml").read_text(encoding="utf-8") == "scan-styling: minimal\n"
 
 
 def test_mktemp_templates_are_busybox_compatible() -> None:

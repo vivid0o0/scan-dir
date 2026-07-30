@@ -1,4 +1,4 @@
-# .gitignore -- Project Summarizer repository exclusions
+# .gitignore -- Scan Dir repository exclusions
 # Excludes local agent state, review artifacts, caches, and temporary outputs.
 # Tags: git, repository, cleanup
 # 2026-07-28

@@ -1,13 +1,13 @@
-# Project Summarizer (PRS)
+# Scan Dir (`sdir`)
 
-A fast, information-rich project summary for your AI agent, giving it full project context instantly without wasting tokens. This drastically improves the AI agent's understanding and performance; it'll instantly know what files are modified, when they were modified, file positions and sizes, and more.
+Scan Dir is a dependency-free Python CLI that turns a file or directory into compact, deterministic terminal context. It reports structure, file metadata, Git state, warnings, and a scan summary without reading descendant symlink targets or unsupported special files.
 
-`prs` shows useful context such as file size, line count, modified time, entry type, git status markers, and a scan summary. It is built for quickly understanding a project or giving an AI agent compact project context.
+Use `sdir` to inspect a project quickly, prepare bounded context for an AI agent, or generate stable plain-text output for scripts and pipelines.
 
 ## Preview
 
 ```bash
-prs ~/code/my-project
+sdir ~/code/my-project
 ```
 
 ```bash
@@ -49,38 +49,39 @@ example-app/                                       entries     lines       size 
 
 ## Features
 
-* Has a SKILL.md ready to give to your agent
-* Easy to use and set up
-* Information-rich
-* Full customizability
-* Ultra fast and lightweight
-* Clean & visually appealing
+* Single-file Python 3.10+ runtime with no third-party runtime dependencies
+* Tree or flat output with selectable metadata and three styling levels
+* Repository-local Git markers with global/system Git configuration disabled
+* Explicit filtering, visibility, timeout, clipboard, and configuration controls
+* Safe handling for hostile filenames, symlinks, partial scans, and broken pipes
+* Transactional Linux/macOS installer with integrity checks and rollback
+* Deterministic, reproducible release archives and an included `SKILL.md`
 
 ## Install
 
 ### Linux / macOS
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/vivid0o0/project-summarizer/main/install.sh | bash
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/vivid0o0/scan-dir/main/install.sh | bash
 ```
 
-Requires Python 3.10+; the installer and managed wrappers require Bash 3.2+. The installer stages `prs.py`, `config.yaml`, and `SKILL.md`, verifies their embedded SHA-256 digests, and installs both command names. Re-running it validates and repairs managed files; owned managed directories are automatically stripped of unsafe group/other write permissions. Run `bash install.sh --help` for installer options.
+Requires Python 3.10+; the installer and managed wrappers require Bash 3.2+. The installer stages `sdir.py`, `config.yaml`, and `SKILL.md`, verifies their embedded SHA-256 digests, and installs both command names. Re-running it validates and repairs managed files; owned managed directories are automatically stripped of unsafe group/other write permissions. Run `bash install.sh --help` for installer options.
 
 ### Full installation (including SKILL.md)
 
 Give this prompt to your favorite AI agent:
 
 ```text
-Install Project Summarizer from the files I provide. Install prs.py, config.yaml, and SKILL.md; expose the prs and project-summarizer commands; run syntax, installer, and CLI validation before reporting completion.
+Install Scan Dir from the files I provide. Install sdir.py, config.yaml, and SKILL.md; expose the sdir and scan-dir commands; run syntax, installer, and CLI validation before reporting completion.
 ```
 
 ## Usage
 
 ```bash
-prs [path] [options]
+sdir [path] [options]
 ```
 
-> **Path is optional. When omitted, `prs` scans the current directory.**
+> **Path is optional. When omitted, `sdir` scans the current directory.**
 
 ## Options
 
@@ -130,23 +131,23 @@ prs [path] [options]
 | Option              | Description                           |
 | ------------------- | ------------------------------------- |
 | `--config <path>`   | Use a specific `config.yaml` file.    |
-| `--project-config <auto\|ignore\|require>` | Control project `.prs.yaml` or `prs.yaml` discovery. |
+| `--project-config <auto\|ignore\|require>` | Control project `.sdir.yaml` or `sdir.yaml` discovery. |
 | `--help`, `-h`      | Show help text and exit.              |
 | `--version`         | Show version number and exit.         |
-| `prs status`        | Show runtime, interpreter, and config status. |
+| `sdir status`        | Show runtime, interpreter, and config status. |
 
 ### Notes
 
 * Options can be combined.
-* When no command-line options are provided, `prs` uses `config.yaml`.
+* When no command-line options are provided, `sdir` uses `config.yaml`.
 * Command-line options override matching `config.yaml` values.
 * `--only` uses explicit CLI selectors and does not turn default ignored names into included names.
-* Config precedence (highest first): `--config <path>` → project `.prs.yaml` or `prs.yaml` → user config → managed `config.yaml` beside `prs.py` → built-in defaults. A generic project `config.yaml` is ignored. Use `--project-config ignore` for untrusted repositories. Project config cannot enable clipboard copying unless it is also supplied explicitly with `--config`. User config persists across installs and is never overwritten.
+* Config precedence (highest first): `--config <path>` → project `.sdir.yaml` or `sdir.yaml` → user config → managed `config.yaml` beside `sdir.py` → built-in defaults. A generic project `config.yaml` is ignored. Use `--project-config ignore` for untrusted repositories. Project config cannot enable clipboard copying unless it is also supplied explicitly with `--config`. User config persists across installs and is never overwritten.
 * Selectors use per-category replacement: CLI `-n foo` replaces the config `names:` list rather than appending.
 
 ## Configuration file
 
-`prs` can read defaults from `config.yaml`.
+`sdir` can read defaults from `config.yaml`.
 
 ```yaml
 # Ignore exact relative paths (and everything under them)
@@ -221,7 +222,7 @@ When `tree` is omitted from scan-data, entries are shown as a flat list (no tree
 
 ## Git status markers
 
-Git markers appear when the scan path is inside a git repository. For deterministic and non-interactive scans, PRS disables system/global Git configuration; markers therefore reflect repository-local ignore rules rather than personal global excludes.
+Git markers appear when the scan path is inside a git repository. For deterministic and non-interactive scans, SDIR disables system/global Git configuration; markers therefore reflect repository-local ignore rules rather than personal global excludes.
 
 | Marker | Meaning   |
 | ------ | --------- |
@@ -241,13 +242,23 @@ Git markers appear when the scan path is inside a git repository. For determinis
 
 ## Exit codes
 
-| Code | Meaning                         |
-| ---- | ------------------------------- |
-| `0`  | Success                         |
-| `1`  | Runtime error (PrsError, OSError, clipboard failure) |
-| `2`  | Configuration error (ConfigError) |
-| `70` | Rollback could not fully restore; the prior backup path is preserved and reported |
-| `130`| Interrupted (`Ctrl+C`)          |
+### `sdir` command
+
+| Code  | Meaning                                                   |
+| ----- | --------------------------------------------------------- |
+| `0`   | Success, including a clean downstream broken-pipe exit    |
+| `1`   | Runtime, operating-system, or requested clipboard failure |
+| `2`   | Argument or configuration error                           |
+| `130` | Interrupted (`Ctrl+C`)                                    |
+
+### `install.sh`
+
+| Code  | Meaning                                                                    |
+| ----- | -------------------------------------------------------------------------- |
+| `0`   | Install, repair, or dry-run validation succeeded                            |
+| `1`   | Validation, download, integrity, safety, or installation failure            |
+| `70`  | Rollback could not fully restore; the preserved backup path is reported     |
+| `130` | Interrupted (`Ctrl+C`); rollback is attempted before the installer exits    |
 
 ## License
 

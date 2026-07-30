@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# prs.py -- Project Summarizer runtime
+# sdir.py -- Scan Dir runtime
 # Scans a file or directory and renders deterministic project context with
 # configurable filtering, metadata, Git state, and safe terminal output.
 # Tags: cli, filesystem, git, rendering, configuration
@@ -27,13 +27,13 @@ from typing import Any, Literal, NoReturn, TextIO
 
 # ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
-PROGRAM_NAME = "prs"
-ALIAS_COMMAND = "project-summarizer"
-PRODUCT_TITLE = "Project Summarizer"
-VERSION = "2026.07.29.2"
+PROGRAM_NAME = "sdir"
+ALIAS_COMMAND = "scan-dir"
+PRODUCT_TITLE = "Scan Dir"
+VERSION = "1.0.0"
 CONFIG_FILE_NAME = "config.yaml"
-CONFIG_DIRECTORY_NAME = "project-summarizer"
-PROJECT_CONFIG_FILE_NAMES = (".prs.yaml", "prs.yaml")
+CONFIG_DIRECTORY_NAME = "scan-dir"
+PROJECT_CONFIG_FILE_NAMES = (".sdir.yaml", "sdir.yaml")
 DEFAULT_SCAN_TIMEOUT_SECONDS = 60.0
 ENTRY_TYPES = ("file", "dir", "link")
 # Emoji prefix shown next to entry names when scan_emojis is enabled.
@@ -120,15 +120,15 @@ ANSI_WHITE = "\033[37m"
 # ─── ERRORS ─────────────────────────────────────────────────────────────────
 
 
-class PrsError(Exception):
+class SdirError(Exception):
     pass
 
 
-class ConfigError(PrsError):
+class ConfigError(SdirError):
     pass
 
 
-class HelpRequested(PrsError):
+class HelpRequested(SdirError):
     """Raised by the argument parser when it requests a clean exit (status 0).
 
     argparse calls ``parser.exit(0, ...)`` when a help action fires; we use
@@ -137,7 +137,7 @@ class HelpRequested(PrsError):
     """
 
 
-class ClipboardError(PrsError):
+class ClipboardError(SdirError):
     pass
 
 
@@ -985,11 +985,11 @@ def load_yaml_payload(path: Path) -> dict[str, object]:
 
 
 def user_config_path() -> Path | None:
-    explicit_dir = os.environ.get("PRS_CONFIG_DIR")
+    explicit_dir = os.environ.get("SDIR_CONFIG_DIR")
     if explicit_dir:
-        candidate = expand_user_path(explicit_dir, "PRS_CONFIG_DIR")
+        candidate = expand_user_path(explicit_dir, "SDIR_CONFIG_DIR")
         if not candidate.is_absolute():
-            raise ConfigError(f"PRS_CONFIG_DIR must be absolute: {sanitize_terminal_text(explicit_dir)}")
+            raise ConfigError(f"SDIR_CONFIG_DIR must be absolute: {sanitize_terminal_text(explicit_dir)}")
         return candidate / CONFIG_FILE_NAME
 
     xdg_home = os.environ.get("XDG_CONFIG_HOME")
@@ -1143,7 +1143,7 @@ def render_status(color: bool | None = None) -> str:
     config_text = " -> ".join(sanitize_terminal_text(path) for path in cwd_configs)
     if not config_text:
         config_text = "built-in defaults only"
-    # APP_DIR is the directory containing the prs executable that the user
+    # APP_DIR is the directory containing the sdir executable that the user
     # actually invoked, falling back to the source file location when the
     # interpreter was started without an argv[0] (e.g., embedded runs).
     if sys.argv and sys.argv[0]:
@@ -1189,7 +1189,7 @@ def render_version(color: bool | None = None) -> str:
     return f"{style(PROGRAM_NAME, ANSI_CYAN, ANSI_BOLD, enabled=color)} {style(VERSION, ANSI_GREEN, ANSI_BOLD, enabled=color)}\n"
 
 
-class PrsArgumentParser(argparse.ArgumentParser):
+class SdirArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise ConfigError(message)
 
@@ -1207,7 +1207,7 @@ class PrsArgumentParser(argparse.ArgumentParser):
 
 def help_usage_line(color: bool) -> str:
     tokens = (
-        ("prs", (ANSI_CYAN, ANSI_BOLD)),
+        ("sdir", (ANSI_CYAN, ANSI_BOLD)),
         ("[path]", (ANSI_DIM,)),
         ("[mode]", (ANSI_DIM,)),
         ("[selectors]", (ANSI_DIM,)),
@@ -1311,21 +1311,21 @@ def render_help(color: bool | None = None) -> str:
     lines.append(style(rule, ANSI_DIM, ANSI_CYAN, enabled=color))
     lines.extend(("", style("Usage", ANSI_CYAN, ANSI_BOLD, enabled=color), help_usage_line(color)))
     command_rows = (
-        ("prs", "scan the current directory"),
-        ("prs <path>", "scan a file or directory"),
-        ("prs help", "show full help"),
-        ("prs version", "show version"),
-        ("prs status", "show runtime status"),
+        ("sdir", "scan the current directory"),
+        ("sdir <path>", "scan a file or directory"),
+        ("sdir help", "show full help"),
+        ("sdir version", "show version"),
+        ("sdir status", "show runtime status"),
     )
     lines.extend(help_table("Commands", command_rows, color))
     lines.extend(("", style("Examples", ANSI_CYAN, ANSI_BOLD, enabled=color)))
     for example in (
-        "prs",
-        "prs ~/code/app",
-        "prs --only .md",
-        'prs ~/code/app --only -e .ts .tsx --scan-data "tree, lines, size"',
-        "prs ~/code/app --ignore-hidden --ignore-empty --scan-styling full",
-        "prs --only .md -- ~/code/app",
+        "sdir",
+        "sdir ~/code/app",
+        "sdir --only .md",
+        'sdir ~/code/app --only -e .ts .tsx --scan-data "tree, lines, size"',
+        "sdir ~/code/app --ignore-hidden --ignore-empty --scan-styling full",
+        "sdir --only .md -- ~/code/app",
     ):
         lines.extend(help_wrapped_lines(example, color, ANSI_GREEN, indent=2))
     lines.append(style(rule, ANSI_DIM, ANSI_CYAN, enabled=color))
@@ -1398,7 +1398,10 @@ def render_help(color: bool | None = None) -> str:
             "Configuration",
             (
                 ("--config <path>", "Use a specific config.yaml file."),
-                ("--project-config <auto|ignore|require>", "Control repository-owned .prs.yaml or prs.yaml discovery."),
+                (
+                    "--project-config <auto|ignore|require>",
+                    "Control repository-owned .sdir.yaml or sdir.yaml discovery.",
+                ),
             ),
             color,
         )
@@ -1432,7 +1435,7 @@ def render_usage_error(message: str, color: bool | None = None) -> str:
     message = sanitize_terminal_text(message)
     lines = help_wrapped_lines(f"{PROGRAM_NAME}: {message}", color, ANSI_RED, ANSI_BOLD)
     lines.extend(("", style("Usage", ANSI_CYAN, ANSI_BOLD, enabled=color), help_usage_line(color)))
-    lines.extend(help_wrapped_lines("prs help", color, ANSI_CYAN, indent=2))
+    lines.extend(help_wrapped_lines("sdir help", color, ANSI_CYAN, indent=2))
     return "\n".join(lines) + "\n"
 
 
@@ -1447,9 +1450,9 @@ def render_runtime_error(message: str, color: bool | None = None) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = PrsArgumentParser(
+    parser = SdirArgumentParser(
         prog=PROGRAM_NAME,
-        description="Project Summarizer scans a project directory and prints a compact information-rich tree.",
+        description="Scan Dir scans a project directory and prints a compact information-rich tree.",
         allow_abbrev=False,
         add_help=False,
     )
@@ -2302,7 +2305,7 @@ def scan(config: RuntimeConfig) -> ScanResult:
     )
     root = scan_path(config.root_path, ".", state, is_root=True, physical_path=physical_root)
     if root is None:
-        raise PrsError("scan root was excluded by the active filters or is not a supported filesystem entry")
+        raise SdirError("scan root was excluded by the active filters or is not a supported filesystem entry")
     git_markers: dict[str, str] = {}
     deleted_git_entries: list[DeletedGitEntry] = []
     if "git" in config.scan_data:
@@ -3635,7 +3638,7 @@ def run(argv: Sequence[str]) -> int:
                 # No backend in this environment (headless server, container,
                 # CI). The scan output is already on stdout and fully usable;
                 # auto-copy is a convenience, not a core function. Warn and
-                # continue so prs works out of the box everywhere.
+                # continue so sdir works out of the box everywhere.
                 write_stream(sys.stderr, f"{PROGRAM_NAME}: auto-copy skipped: {exc}\n")
             except ClipboardFailureError as exc:
                 # A backend was detected but the copy operation broke. This is
@@ -3654,7 +3657,7 @@ def run(argv: Sequence[str]) -> int:
     except ConfigError as exc:
         write_stream(sys.stderr, render_usage_error(str(exc)))
         return 2
-    except PrsError as exc:
+    except SdirError as exc:
         write_stream(sys.stderr, render_runtime_error(str(exc)))
         return 1
     except BrokenPipeError:

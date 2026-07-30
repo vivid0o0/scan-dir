@@ -1,17 +1,17 @@
-<!-- SKILL.md -- Project Summarizer agent skill -->
-<!-- Operating contract for compact, reliable project context with PRS. -->
+<!-- SKILL.md -- Scan Dir agent skill -->
+<!-- Operating contract for compact, reliable project context with SDIR. -->
 <!-- Tags: agent-skill, project-context, cli, filesystem, git -->
 <!-- 2026-07-28 -->
 
-# Project Summarizer
+# Scan Dir
 
-Use `prs` to obtain a compact structural and metadata overview before reading a project file by file. Treat its output as a navigation aid, not as a substitute for source inspection.
+Use `sdir` to obtain a compact structural and metadata overview before reading a project file by file. Treat its output as a navigation aid, not as a substitute for source inspection.
 
 ## Availability
 
 ```bash
-prs version
-prs status
+sdir version
+sdir status
 ```
 
 If the command is unavailable, install the provided package with `install.sh`. Do not invent scan output or assume configuration was installed correctly.
@@ -19,7 +19,7 @@ If the command is unavailable, install the provided package with `install.sh`. D
 ## Recommended scan
 
 ```bash
-prs <project-path> \
+sdir <project-path> \
   --scan-styling minimal \
   --scan-emojis false \
   --scan-data "tree, lines, size, modified, type, git, summary" \
@@ -30,9 +30,9 @@ prs <project-path> \
 Use a narrower scan when less context is needed:
 
 ```bash
-prs <project-path> --scan-data tree --scan-styling minimal --scan-emojis false
-prs <project-path> --scan-data summary --scan-styling minimal --scan-emojis false
-prs <project-path> --only -e .py .toml --scan-styling minimal --scan-emojis false
+sdir <project-path> --scan-data tree --scan-styling minimal --scan-emojis false
+sdir <project-path> --scan-data summary --scan-styling minimal --scan-emojis false
+sdir <project-path> --only -e .py .toml --scan-styling minimal --scan-emojis false
 ```
 
 ## Deterministic argument rules
@@ -76,16 +76,16 @@ In ignore mode, each CLI selector category replaces the corresponding configured
 -h, --help / --version
 ```
 
-Valid data items are `tree`, `lines`, `size`, `modified`, `type`, `git`, and `summary`. At least one item is required. Without `tree`, PRS prints relative-path flat rows.
+Valid data items are `tree`, `lines`, `size`, `modified`, `type`, `git`, and `summary`. At least one item is required. Without `tree`, SDIR prints relative-path flat rows.
 
 ## Configuration layers
 
 Configuration merges from low to high precedence:
 
 1. Built-in defaults
-2. Managed `config.yaml` beside `prs.py`
+2. Managed `config.yaml` beside `sdir.py`
 3. User `config.yaml`
-4. Project `.prs.yaml` or `prs.yaml`
+4. Project `.sdir.yaml` or `sdir.yaml`
 5. Explicit `--config`
 
 A higher file overrides only keys it defines. A generic project `config.yaml` is ignored. Use `--project-config ignore` when scanning untrusted code. Project configuration cannot enable clipboard copying unless the same file is explicitly trusted with `--config`. Personal defaults belong in the user configuration directory, not in the installer-managed app directory.
@@ -108,4 +108,4 @@ A higher file overrides only keys it defines. A generic project `config.yaml` is
 4. Narrow large scans by path or selector instead of hiding timeout state.
 5. Keep auto-copy disabled in pipelines and automated workflows.
 6. Report warnings and timeout state; never present partial output as complete.
-7. Use `prs help` as the canonical installed CLI reference.
+7. Use `sdir help` as the canonical installed CLI reference.

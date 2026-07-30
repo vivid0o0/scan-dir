@@ -1,4 +1,4 @@
-# config.yaml -- Project Summarizer managed defaults
+# config.yaml -- Scan Dir managed defaults
 # Safe default filtering, visibility, rendering, and runtime behavior.
 # Tags: configuration, filtering, rendering, runtime
 # 2026-07-28

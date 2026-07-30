@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parents[1]
-RELEASE_FILES = ("LICENSE", "README.md", "SKILL.md", "config.yaml", "install.sh", "prs.py")
+RELEASE_FILES = ("LICENSE", "README.md", "SKILL.md", "config.yaml", "install.sh", "sdir.py")
 RELEASE_FILE_MAX_BYTES = 16 * 1024 * 1024
 READ_CHUNK_BYTES = 64 * 1024
 
@@ -110,7 +110,7 @@ def sha256(payload: bytes) -> str:
 
 def verify_release(snapshot: Mapping[str, bytes] | None = None) -> str:
     release = load_release_snapshot() if snapshot is None else snapshot
-    runtime_text = decode_release_file(release, "prs.py")
+    runtime_text = decode_release_file(release, "sdir.py")
     installer_text = decode_release_file(release, "install.sh")
     readme_text = decode_release_file(release, "README.md")
 
@@ -122,9 +122,41 @@ def verify_release(snapshot: Mapping[str, bytes] | None = None) -> str:
     )
     if runtime_version != installer_version:
         fail(f"runtime and installer versions differ ({runtime_version} != {installer_version})")
+    if re.fullmatch(r"(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)", runtime_version) is None:
+        fail(f"release version is not canonical semantic version X.Y.Z: {runtime_version}")
+
+    runtime_identity = {
+        "PROGRAM_NAME": "sdir",
+        "ALIAS_COMMAND": "scan-dir",
+        "PRODUCT_TITLE": "Scan Dir",
+        "CONFIG_DIRECTORY_NAME": "scan-dir",
+    }
+    for constant, expected in runtime_identity.items():
+        actual = require_match(rf'^\s*{constant} = "([^"]+)"$', runtime_text, constant)
+        if actual != expected:
+            fail(f"{constant} has unexpected value ({actual} != {expected})")
+    installer_identity = {
+        "PRODUCT_TITLE": "Scan Dir",
+        "PRODUCT_SLUG": "scan-dir",
+        "PRIMARY_COMMAND": "sdir",
+        "ALIAS_COMMAND": "scan-dir",
+        "RUNTIME_FILE": "sdir.py",
+    }
+    for constant, expected in installer_identity.items():
+        actual = require_match(rf"^readonly {constant}='([^']+)'$", installer_text, constant)
+        if actual != expected:
+            fail(f"{constant} has unexpected value ({actual} != {expected})")
+
+    for filename in ("README.md", "SKILL.md", "sdir.py", "config.yaml"):
+        text = decode_release_file(release, filename)
+        for stale in ("Project Summarizer", "project-summarizer", "prs.py", ".prs.yaml", "prs.yaml"):
+            if stale in text:
+                fail(f"stale pre-1.0 identity {stale!r} remains in {filename}")
+    if "https://raw.githubusercontent.com/vivid0o0/scan-dir/main/install.sh" not in readme_text:
+        fail("README install URL does not target the scan-dir repository")
 
     package_files = (
-        ("DEFAULT_RUNTIME_SHA256", "prs.py"),
+        ("DEFAULT_RUNTIME_SHA256", "sdir.py"),
         ("DEFAULT_CONFIG_SHA256", "config.yaml"),
         ("DEFAULT_SKILL_SHA256", "SKILL.md"),
     )

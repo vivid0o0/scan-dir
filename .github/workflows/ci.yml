@@ -109,7 +109,7 @@ jobs:
       - name: Verify release tag and metadata
         id: release
         run: |
-          version="$(python -S prs.py version | awk '{print $2}')"
+          version="$(python -S sdir.py version | awk '{print $2}')"
           if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
             printf 'tag %s does not match runtime version v%s\n' "$GITHUB_REF_NAME" "$version" >&2
             exit 1
@@ -128,8 +128,8 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          "dist/project-summarizer-${VERSION}.tar.gz"
+          "dist/scan-dir-${VERSION}.tar.gz"
           dist/SHA256SUMS
           --verify-tag
-          --title "Project Summarizer ${VERSION}"
+          --title "Scan Dir ${VERSION}"
           --generate-notes

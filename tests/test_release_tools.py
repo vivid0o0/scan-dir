@@ -1,4 +1,4 @@
-# test_release_tools.py -- Project Summarizer release tooling tests
+# test_release_tools.py -- Scan Dir release tooling tests
 # Verifies deterministic archive bytes, package contents, metadata, and checksums.
 # Tags: tests, release, packaging, reproducibility
 # 2026-07-28
@@ -15,14 +15,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BUILDER = ROOT / "tools" / "build_release.py"
-VERSION = re.search(r'^VERSION = "([^"]+)"$', (ROOT / "prs.py").read_text(), re.MULTILINE).group(1)
+VERSION = re.search(r'^VERSION = "([^"]+)"$', (ROOT / "sdir.py").read_text(), re.MULTILINE).group(1)
 EXPECTED_FILES = {
     "LICENSE": 0o644,
     "README.md": 0o644,
     "SKILL.md": 0o644,
     "config.yaml": 0o644,
     "install.sh": 0o755,
-    "prs.py": 0o755,
+    "sdir.py": 0o755,
 }
 
 
@@ -48,7 +48,7 @@ def test_release_archive_is_reproducible_and_complete(tmp_path: Path) -> None:
     digest = hashlib.sha256(first_archive.read_bytes()).hexdigest()
     assert first_checksums.read_text(encoding="ascii") == f"{digest}  {first_archive.name}\n"
 
-    package_root = f"project-summarizer-{VERSION}"
+    package_root = f"scan-dir-{VERSION}"
     with tarfile.open(first_archive, "r:gz") as archive:
         members = archive.getmembers()
         assert [member.name for member in members] == [f"{package_root}/{filename}" for filename in EXPECTED_FILES]
@@ -90,7 +90,7 @@ def test_release_builder_rejects_invalid_embedded_metadata(tmp_path: Path) -> No
         check=False,
     )
     assert result.returncode != 0
-    assert "does not match prs.py" in result.stderr
+    assert "does not match sdir.py" in result.stderr
     assert not output.exists()
 
 
@@ -145,14 +145,14 @@ original_verify = build_release.verify_release
 
 def racing_verify(snapshot):
     version = original_verify(snapshot)
-    with Path("prs.py").open("ab") as handle:
+    with Path("sdir.py").open("ab") as handle:
         handle.write(b"\n# changed after verification\n")
     return version
 
 build_release.verify_release = racing_verify
 archive, _checksums = build_release.build_release(Path("dist"))
 with tarfile.open(archive, "r:gz") as package:
-    member = next(item for item in package.getmembers() if item.name.endswith("/prs.py"))
+    member = next(item for item in package.getmembers() if item.name.endswith("/sdir.py"))
     extracted = package.extractfile(member)
     assert extracted is not None
     archived = extracted.read()
@@ -214,7 +214,7 @@ def test_release_builder_rejects_concurrent_output_writer(tmp_path: Path) -> Non
 def test_release_builder_reports_unreplaceable_output_without_traceback(tmp_path: Path) -> None:
     output = tmp_path / "output"
     output.mkdir()
-    archive_path = output / f"project-summarizer-{VERSION}.tar.gz"
+    archive_path = output / f"scan-dir-{VERSION}.tar.gz"
     archive_path.mkdir()
     result = subprocess.run(
         [sys.executable, str(BUILDER), "--output-dir", str(output)],

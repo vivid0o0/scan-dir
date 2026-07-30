@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a deterministic Project Summarizer release archive and checksum file."""
+"""Build a deterministic Scan Dir release archive and checksum file."""
 
 from __future__ import annotations
 
@@ -16,21 +16,21 @@ import tarfile
 import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
 from verify_release import load_release_snapshot, verify_release
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION_PATTERN = re.compile(r'^VERSION = "(\d{4}\.\d{2}\.\d{2}\.\d+)"$', re.MULTILINE)
+VERSION_PATTERN = re.compile(r'^VERSION = "(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"$', re.MULTILINE)
+RELEASE_EPOCH = 1785283200  # 2026-07-29T00:00:00Z
 PACKAGE_FILES: tuple[tuple[str, int], ...] = (
     ("LICENSE", 0o644),
     ("README.md", 0o644),
     ("SKILL.md", 0o644),
     ("config.yaml", 0o644),
     ("install.sh", 0o755),
-    ("prs.py", 0o755),
+    ("sdir.py", 0o755),
 )
 
 
@@ -40,24 +40,15 @@ def fail(message: str) -> NoReturn:
 
 def runtime_version(snapshot: Mapping[str, bytes]) -> str:
     try:
-        runtime_text = snapshot["prs.py"].decode("utf-8")
+        runtime_text = snapshot["sdir.py"].decode("utf-8")
     except KeyError:
-        fail("release snapshot is missing prs.py")
+        fail("release snapshot is missing sdir.py")
     except UnicodeError as exc:
-        fail(f"prs.py is not valid UTF-8: {exc}")
+        fail(f"sdir.py is not valid UTF-8: {exc}")
     match = VERSION_PATTERN.search(runtime_text)
     if match is None:
-        fail("runtime version is missing or does not use YYYY.MM.DD.N format")
-    return match.group(1)
-
-
-def release_epoch(version: str) -> int:
-    year, month, day, _revision = (int(part) for part in version.split("."))
-    try:
-        release_date = datetime(year, month, day, tzinfo=timezone.utc)
-    except ValueError as exc:
-        fail(f"runtime version contains an invalid release date: {exc}")
-    return int(release_date.timestamp())
+        fail("runtime version is missing or is not canonical semantic version X.Y.Z")
+    return ".".join(match.groups())
 
 
 def sha256(path: Path) -> str:
@@ -148,8 +139,8 @@ def build_release(output_dir: Path) -> tuple[Path, Path]:
     version = runtime_version(snapshot)
     if version != verified_version:
         fail(f"release verifier returned inconsistent version: {verified_version}")
-    epoch = release_epoch(version)
-    package_root = f"project-summarizer-{version}"
+    epoch = RELEASE_EPOCH
+    package_root = f"scan-dir-{version}"
     prepare_output_directory(output_dir)
     with locked_output_directory(output_dir):
         archive_path = output_dir / f"{package_root}.tar.gz"
