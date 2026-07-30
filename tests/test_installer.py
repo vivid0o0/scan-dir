@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"
 RUNTIME = ROOT / "sdir.py"
@@ -70,6 +72,9 @@ def run_installer(
             "HOME": str(p["home"]),
             "PATH": os.environ["PATH"],
             "PYTHON": sys.executable,
+            "XDG_CONFIG_HOME": str(p["home"] / ".config"),
+            "XDG_DATA_HOME": str(p["home"] / ".local" / "share"),
+            "XDG_STATE_HOME": str(p["home"] / ".local" / "state"),
         }
     )
     if env_overrides:
@@ -730,12 +735,33 @@ def test_foreign_bridge_marker_does_not_claim_bridge_ownership(tmp_path: Path) -
     assert_installed(p)
 
 
-def create_legacy_install(p: dict[str, Path], *, foreign_wrapper: bool = False) -> dict[str, Path]:
-    legacy = {
-        "app": p["home"] / ".local" / "share" / "project-summarizer",
-        "state": p["home"] / ".local" / "state" / "project-summarizer",
-        "config": p["home"] / ".config" / "project-summarizer",
+def legacy_paths(
+    p: dict[str, Path],
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> dict[str, Path]:
+    if sys.platform == "darwin":
+        base = p["home"] / "Library" / "Application Support" / "project-summarizer"
+        return {"app": base / "app", "state": base / "state", "config": base / "config"}
+
+    overrides = env_overrides or {}
+    data_base = Path(overrides.get("XDG_DATA_HOME", p["home"] / ".local" / "share"))
+    state_base = Path(overrides.get("XDG_STATE_HOME", p["home"] / ".local" / "state"))
+    config_base = Path(overrides.get("XDG_CONFIG_HOME", p["home"] / ".config"))
+    return {
+        "app": data_base / "project-summarizer",
+        "state": state_base / "project-summarizer",
+        "config": config_base / "project-summarizer",
     }
+
+
+def create_legacy_install(
+    p: dict[str, Path],
+    *,
+    foreign_wrapper: bool = False,
+    env_overrides: dict[str, str] | None = None,
+) -> dict[str, Path]:
+    legacy = legacy_paths(p, env_overrides=env_overrides)
     legacy["app"].mkdir(parents=True)
     legacy["app"].chmod(0o700)
     (legacy["app"] / ".managed").write_text("project-summarizer managed command\n", encoding="utf-8")
@@ -790,6 +816,27 @@ def test_legacy_managed_install_migrates_config_and_is_removed(tmp_path: Path) -
     assert not legacy["config"].exists()
     assert not (p["bin"] / "prs").exists()
     assert not (p["bin"] / "project-summarizer").exists()
+
+
+def test_legacy_migration_respects_custom_xdg_roots(tmp_path: Path) -> None:
+    if sys.platform == "darwin":
+        pytest.skip("Darwin legacy installs use Library/Application Support instead of XDG roots")
+
+    p = paths(tmp_path)
+    env_overrides = {
+        "XDG_DATA_HOME": str(tmp_path / "xdg-data"),
+        "XDG_STATE_HOME": str(tmp_path / "xdg-state"),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg-config"),
+    }
+    legacy = create_legacy_install(p, env_overrides=env_overrides)
+
+    result = run_installer(p, install_args(p), env_overrides=env_overrides)
+    assert result.returncode == 0, result.stderr
+    assert_installed(p)
+    assert (p["config"] / "config.yaml").read_text(encoding="utf-8") == "scan-styling: minimal\n"
+    assert not legacy["app"].exists()
+    assert not legacy["state"].exists()
+    assert not legacy["config"].exists()
 
 
 def test_legacy_cleanup_preserves_unproven_command_and_runtime(tmp_path: Path) -> None:
