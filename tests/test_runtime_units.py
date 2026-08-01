@@ -413,6 +413,11 @@ def test_clipboard_command_and_aggregation(monkeypatch: pytest.MonkeyPatch) -> N
         sdir.copy_to_clipboard("text")
 
 
+def test_help_explains_scan_data_layout() -> None:
+    help_text = " ".join(sdir.render_help(color=False).split())
+    assert "Omitting tree uses flat paths; summary adds the summary block." in help_text
+
+
 def test_entrypoint_error_boundaries(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
     monkeypatch.setattr(sdir, "resolve_runtime_config", lambda _argv: (_ for _ in ()).throw(OSError("disk")))
     assert sdir.run(["."]) == 1

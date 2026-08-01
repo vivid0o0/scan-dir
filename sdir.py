@@ -1375,7 +1375,8 @@ def render_help(color: bool | None = None) -> str:
                 ("--scan-emojis <true|false>", "Show or hide file-type emojis in entry names."),
                 (
                     '--scan-data <"item, item, ...">',
-                    "Comma-separated items: tree, lines, size, modified, type, git, summary.",
+                    "Comma-separated items: tree, lines, size, modified, type, git, summary. "
+                    "Omitting tree uses flat paths; summary adds the summary block.",
                 ),
             ),
             color,
