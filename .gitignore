@@ -1,0 +1,24 @@
+# .gitignore -- Scan Dir repository exclusions
+# Excludes local agent state, review artifacts, caches, and temporary outputs.
+# Tags: git, repository, cleanup
+# 2026-07-28
+
+agents/
+review.md
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+
+*.log
+*.tmp
+*.temp
+*.bak
+*.rollback.*
+.DS_Store
+Thumbs.db

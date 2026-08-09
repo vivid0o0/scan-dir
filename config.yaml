@@ -1,0 +1,48 @@
+# config.yaml -- Scan Dir managed defaults
+# Safe default filtering, visibility, rendering, and runtime behavior.
+# Tags: configuration, filtering, rendering, runtime
+# 2026-07-28
+
+# Ignore exact relative paths and everything below matched directories.
+paths: []
+
+# Ignore entry types: file, dir, link.
+types: []
+
+# Ignore file extensions. Include the leading dot.
+extensions: []
+
+# Ignore exact file or directory basenames.
+names:
+  - .git
+  - node_modules
+  - __pycache__
+  - .venv
+  - venv
+  - dist
+  - build
+  - .next
+  - .turbo
+  - .cache
+  - .idea
+  - .pytest_cache
+  - .mypy_cache
+  - .ruff_cache
+  - .tox
+  - .eggs
+  - .DS_Store
+  - Thumbs.db
+  - coverage
+
+# Visibility.
+ignore-hidden: false
+ignore-empty: false
+
+# Rendering.
+scan-styling: full
+scan-emojis: true
+scan-data: "max"
+
+# Runtime.
+scan-timeout: 60
+auto-copy: false

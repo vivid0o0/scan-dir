@@ -1,0 +1,30 @@
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["agents"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+show_error_codes = true
+files = ["sdir.py", "tools/build_release.py", "tools/verify_release.py"]
+exclude = ["^agents/"]
+
+[tool.coverage.run]
+branch = true
+include = ["sdir.py"]
+
+[tool.coverage.report]
+fail_under = 100
+precision = 1
+show_missing = true
+skip_covered = false
