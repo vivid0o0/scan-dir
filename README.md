@@ -81,7 +81,7 @@ Once installed, take [SKILL.md](https://raw.githubusercontent.com/vivid0o0/scan-
 curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/vivid0o0/scan-dir/main/install.sh | bash
 ```
 
-2. Put `SKILL.md](https://raw.githubusercontent.com/vivid0o0/scan-dir/refs/heads/main/SKILL.md)` in your agent's skills directory.
+2. Put [SKILL.md](https://raw.githubusercontent.com/vivid0o0/scan-dir/refs/heads/main/SKILL.md) in your agent's skills directory.
 
 ## Usage
 
